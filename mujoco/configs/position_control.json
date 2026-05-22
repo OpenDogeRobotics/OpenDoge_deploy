@@ -1,0 +1,84 @@
+{
+  "model_path": "../../../OpenDoge_description/URDF/xml/scene.xml",
+  "control_dt": 0.002,
+  "duration": 20.0,
+  "render": true,
+  "base_pose": {
+    "position": [0.0, 0.0, 0.18],
+    "quaternion": [1.0, 0.0, 0.0, 0.0]
+  },
+  "joint_order": [
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint"
+  ],
+  "default_joint_angles": {
+    "FL_hip_joint": 0.0,
+    "FL_thigh_joint": 0.55,
+    "FL_calf_joint": -1.55,
+    "FR_hip_joint": 0.0,
+    "FR_thigh_joint": 0.55,
+    "FR_calf_joint": -1.55,
+    "RL_hip_joint": 0.0,
+    "RL_thigh_joint": 0.55,
+    "RL_calf_joint": -1.55,
+    "RR_hip_joint": 0.0,
+    "RR_thigh_joint": 0.55,
+    "RR_calf_joint": -1.55
+  },
+  "gains": {
+    "hip": {
+      "kp": 18.0,
+      "kd": 0.5
+    },
+    "thigh": {
+      "kp": 22.0,
+      "kd": 0.6
+    },
+    "calf": {
+      "kp": 20.0,
+      "kd": 0.5
+    }
+  },
+  "sine_motion": {
+    "frequency_hz": 0.5,
+    "amplitude_rad": {
+      "hip": 0.08,
+      "thigh": 0.18,
+      "calf": 0.22
+    }
+  },
+  "action_ik": {
+    "urdf_path": "../../../OpenDoge_description/URDF/urdf/Opendoge.urdf",
+    "cycle_time": 0.26,
+    "duty_factor": 0.58,
+    "step_height": 0.035,
+    "step_x": 0.085,
+    "step_y": 0.050,
+    "step_yaw": 0.060,
+    "rear_stance_height_offset": 0.015,
+    "startup_blend_time": 0.12,
+    "max_joint_speed_rad_s": 18.0,
+    "key_hold_timeout": 0.18
+  },
+  "imu_feedback": {
+    "enabled": true,
+    "heading_kp": 0.25,
+    "yaw_rate_kd": 0.03,
+    "max_yaw_correction": 0.08,
+    "roll_kp": 0.012,
+    "roll_kd": 0.001,
+    "pitch_kp": 0.012,
+    "pitch_kd": 0.001,
+    "max_foot_z_correction": 0.003
+  }
+}
