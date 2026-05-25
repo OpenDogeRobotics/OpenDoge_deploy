@@ -20,6 +20,7 @@ if str(MUJOCO_DIR) not in sys.path:
     sys.path.insert(0, str(MUJOCO_DIR))
 
 from opendoge_mujoco.action_gait import BodyCommand, GaitConfig, TrotCycloidGait
+from opendoge_mujoco.foot_track_gait import FootTrackGait, FootTrackParams
 from opendoge_mujoco.imu_feedback import IMUFeedbackConfig, IMUReader, IMUStabilizer
 from opendoge_mujoco.leg_ik import OpenDogeLegIK, load_leg_geometries_from_urdf
 from opendoge_mujoco.position_controller import JointCommand, PDPositionController
@@ -279,6 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmd-vx", type=float, default=0.0, help="Headless forward command in [-1, 1].")
     parser.add_argument("--cmd-vy", type=float, default=0.0, help="Headless lateral command in [-1, 1].")
     parser.add_argument("--cmd-yaw", type=float, default=0.0, help="Headless yaw command in [-1, 1].")
+    parser.add_argument("--c-style", action="store_true", help="Use C-style foot track planner instead of TrotCycloidGait.")
     return parser
 
 
@@ -325,18 +327,23 @@ def main() -> int:
     leg_geometries = load_leg_geometries_from_urdf(urdf_path, legs)
     ik = OpenDogeLegIK(leg_geometries, joint_names)
     nominal_feet = ik.nominal_feet(default_by_joint)
-    planner = TrotCycloidGait(
-        nominal_feet,
-        GaitConfig(
-            cycle_time=float(ik_config["cycle_time"]),
-            duty_factor=float(ik_config["duty_factor"]),
-            step_height=float(ik_config["step_height"]),
-            step_x=float(ik_config["step_x"]),
-            step_y=float(ik_config["step_y"]),
-            step_yaw=float(ik_config["step_yaw"]),
-            rear_stance_height_offset=float(ik_config["rear_stance_height_offset"]),
-        ),
-    )
+    if args.c_style:
+        planner = FootTrackGait(nominal_feet, None)
+        planner_display = f"C-style foot_track (h={planner.p.leg_high:.3f})"
+    else:
+        planner = TrotCycloidGait(
+            nominal_feet,
+            GaitConfig(
+                cycle_time=float(ik_config["cycle_time"]),
+                duty_factor=float(ik_config["duty_factor"]),
+                step_height=float(ik_config["step_height"]),
+                step_x=float(ik_config["step_x"]),
+                step_y=float(ik_config["step_y"]),
+                step_yaw=float(ik_config["step_yaw"]),
+                rear_stance_height_offset=float(ik_config["rear_stance_height_offset"]),
+            ),
+        )
+        planner_display = "TrotCycloidGait"
 
     initialize_pose(model, data, controller, default_q, config["base_pose"])
     imu_stabilizer.reset(imu_reader.read(data))
@@ -413,6 +420,7 @@ def main() -> int:
             key_source = keyboard
             print(f"Keyboard backend: MuJoCo callback fallback ({exc}); release uses key_hold_timeout.")
 
+        print(f"Planner: {planner_display}")
         print("Keyboard: hold Up/Down forward/back, hold Left/Right strafe, hold Ctrl+Left/Right yaw, release to stand, Space stop, R reset, Esc exit.")
         viewer = None
         try:
@@ -432,7 +440,7 @@ def main() -> int:
                     (
                         mujoco.mjtFontScale.mjFONTSCALE_150,
                         mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                        "OpenDoge IK demo",
+                        f"OpenDoge IK demo [{planner_display}]",
                         command_text(command, turn_mode),
                     )
                 )

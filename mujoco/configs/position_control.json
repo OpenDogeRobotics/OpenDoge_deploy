@@ -70,6 +70,13 @@
     "max_joint_speed_rad_s": 18.0,
     "key_hold_timeout": 0.18
   },
+  "foot_track": {
+    "leg_high": 0.205,
+    "leg_lift_height": 0.050,
+    "start_point": 0.042,
+    "start_point_turn": 0.040,
+    "step_rate": 0.130
+  },
   "imu_feedback": {
     "enabled": true,
     "heading_kp": 0.25,
