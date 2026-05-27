@@ -1,5 +1,5 @@
-policy_path: "{LEGGED_GYM_ROOT_DIR}/logs/flat_opendoge/exported/policies/model_800.pt"
-xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/Opendoge/xml/scene.xml"
+policy_path: "{LEGGED_GYM_ROOT_DIR}/onnx/flat_opendoge_5700.onnx"
+xml_path: "/home/lain/OpenDoge/OpenDoge_train/resources/robots/Opendoge/xml/scene.xml"
 
 # 总仿真时长 (秒)
 simulation_duration: 360.0
@@ -10,7 +10,7 @@ control_decimation: 2
 
 # 顺序: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
 kps: [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
-kds: [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
+kds: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
 # FL FR
 # RL RR
