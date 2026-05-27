@@ -1,4 +1,4 @@
-policy_path: "{LEGGED_GYM_ROOT_DIR}/onnx/flat_opendoge_5700.onnx"
+policy_path: "{LEGGED_GYM_ROOT_DIR}/onnx/flat_opendoge_9000_omni.onnx"
 xml_path: "/home/lain/OpenDoge/OpenDoge_train/resources/robots/Opendoge/xml/scene.xml"
 
 # 总仿真时长 (秒)
