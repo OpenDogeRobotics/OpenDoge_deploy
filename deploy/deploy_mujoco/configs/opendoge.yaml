@@ -1,5 +1,5 @@
 policy_path: "{LEGGED_GYM_ROOT_DIR}/onnx/flat_opendoge_9000_omni.onnx"
-xml_path: "/home/lain/OpenDoge/OpenDoge_train/resources/robots/Opendoge/xml/scene.xml"
+# xml_path: ""  # uses default: {PROJECT_ROOT}/resources/robots/Opendoge/xml/scene.xml
 
 # 总仿真时长 (秒)
 simulation_duration: 360.0

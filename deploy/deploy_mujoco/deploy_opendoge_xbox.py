@@ -1,3 +1,16 @@
+"""
+OpenDoge MuJoCo Sim2Sim — XBOX 手柄控制版
+
+左摇杆: 前进/后退 + 左/右平移
+右摇杆: 左转/右转
+START 键: 暂停/恢复
+BACK 键: 退出
+
+用法:
+    python deploy/deploy_mujoco/deploy_opendoge_xbox.py
+    python deploy/deploy_mujoco/deploy_opendoge_xbox.py --onnx onnx/flat_opendoge_9000_omni.onnx
+"""
+
 import time
 import os
 import argparse
@@ -7,8 +20,6 @@ import mujoco.viewer
 import onnxruntime as ort
 import yaml
 from collections import deque
-from pynput import keyboard
-from onnx_path_utils import resolve_onnx_path
 
 # ================= 1. 路径配置 =================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,10 +27,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 YAML_PATH = os.path.join(SCRIPT_DIR, "configs", "opendoge.yaml")
 DEFAULT_XML_PATH = os.path.join(PROJECT_ROOT, "resources", "robots", "Opendoge", "xml", "scene.xml")
 
+from onnx_path_utils import resolve_onnx_path
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Deploy OpenDoge policy in MuJoCo.")
-    parser.add_argument("--onnx", type=str, default=None, help="Absolute or relative path to ONNX policy.")
+    parser = argparse.ArgumentParser(description="Deploy OpenDoge policy in MuJoCo with XBOX controller.")
+    parser.add_argument("--onnx", type=str, default=None)
     return parser.parse_args()
 
 
@@ -32,28 +45,21 @@ ONNX_PATH = resolve_onnx_path(
     robot_name="opendoge",
 )
 
-# 打印路径信息，便于调试路径是否正确
 print(f"YAML: {YAML_PATH}")
 print(f"ONNX: {ONNX_PATH}")
 
 # ================= 2. 全局变量 =================
-# [vx, vy, omega]
-cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # [vx, vy, omega]
 paused = False
 default_dof_pos = None
+running = True
 
 
 # ================= 3. 辅助函数 =================
 def quat_rotate_inverse(q, v):
-    """
-    计算向量 v 在四元数 q 表示坐标系下的逆旋转，用于将重力向量转到机身坐标系。
-    q: [w, x, y, z] (MuJoCo 格式)
-    v: [x, y, z]
-    """
     q_w = q[0]
     q_vec = q[1:4]
-
-    a = v * (2.0 * q_w**2 - 1.0)
+    a = v * (2.0 * q_w ** 2 - 1.0)
     b = np.cross(q_vec, v) * q_w * 2.0
     c = q_vec * np.dot(q_vec, v) * 2.0
     return a - b + c
@@ -76,58 +82,88 @@ def build_policy_input(obs_raw, history_buffer, input_dim, num_obs):
     raise ValueError(f"Unsupported ONNX input dim: {input_dim}")
 
 
-# ================= 4. 键盘控制 =================
-_pressed = set()
+def apply_deadzone(value, deadzone=0.08):
+    """对摇杆轴值施加死区"""
+    if abs(value) < deadzone:
+        return 0.0
+    # 将 [deadzone, 1.0] 重新映射到 [0, 1.0]
+    sign = 1.0 if value > 0 else -1.0
+    return sign * (abs(value) - deadzone) / (1.0 - deadzone)
 
 
-def _update_cmd():
-    global cmd
-    ctrl = keyboard.Key.ctrl_l in _pressed or keyboard.Key.ctrl_r in _pressed
-    vx = vy = omega = 0.0
+# ================= 4. XBOX 手柄输入 =================
+try:
+    import pygame
 
-    if keyboard.Key.up in _pressed:
-        vx = 0.6
-    elif keyboard.Key.down in _pressed:
-        vx = -0.4
+    pygame.init()
+    pygame.joystick.init()
 
-    if keyboard.Key.left in _pressed:
-        if ctrl:
-            vy = 0.4   # Ctrl+← 左平移
-        else:
-            omega = 0.8  # ← 左转
-    elif keyboard.Key.right in _pressed:
-        if ctrl:
-            vy = -0.4  # Ctrl+→ 右平移
-        else:
-            omega = -0.8  # → 右转
+    joystick = None
+    if pygame.joystick.get_count() > 0:
+        joystick = pygame.joystick.Joystick(0)
+        joystick.init()
+        print(f"检测到手柄: {joystick.get_name()} (轴:{joystick.get_numaxes()} 按钮:{joystick.get_numbuttons()})")
+    else:
+        print("警告: 未检测到手柄，请连接 XBOX 控制器后重新启动。")
+        print("将使用零指令运行，仅供调试观察。")
+except ImportError:
+    print("警告: pygame 未安装，无法使用手柄。 pip install pygame")
+    print("将使用零指令运行，仅供调试观察。")
+    joystick = None
+    pygame = None
 
-    cmd[0] = vx
-    cmd[1] = vy
-    cmd[2] = omega
-
-
-def on_press(key):
-    _pressed.add(key)
-    _update_cmd()
+# 速度指令缩放
+CMD_VX_SCALE = 1.5   # 最大前进速度 (m/s)
+CMD_VY_SCALE = 1.0   # 最大侧移速度 (m/s)
+CMD_OMEGA_SCALE = 2.0  # 最大转向速度 (rad/s)
 
 
-def on_release(key):
-    _pressed.discard(key)
-    _update_cmd()
+def poll_joystick():
+    """读取手柄状态，更新全局 cmd。返回 False 表示需要退出。"""
+    global cmd, paused, running
+
+    if joystick is None or pygame is None:
+        return True
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return False
+        if event.type == pygame.JOYBUTTONDOWN:
+            if event.button == 7:  # START
+                paused = not paused
+                print(f"Paused: {paused}")
+            elif event.button == 6:  # BACK
+                print("BACK 键按下，退出仿真。")
+                running = False
+                return False
+
+    # 读取摇杆轴
+    # 左摇杆: 轴0=X(左/右), 轴1=Y(上/下, 前推为负)
+    # 右摇杆: 轴3=X(左/右), 轴4=Y(上/下)
+    lx = apply_deadzone(joystick.get_axis(0))   # 左摇杆 X  -> vy (侧移)
+    ly = apply_deadzone(-joystick.get_axis(1))  # 左摇杆 Y  -> vx (前进, 取反因为前推为负)
+    rx = apply_deadzone(joystick.get_axis(3))   # 右摇杆 X  -> omega (转向)
+
+    cmd[0] = ly * CMD_VX_SCALE
+    cmd[1] = lx * CMD_VY_SCALE
+    cmd[2] = rx * CMD_OMEGA_SCALE
+
+    return True
 
 
+# ================= 5. MuJoCo 回调 =================
 def key_callback(keycode):
+    """MuJoCo viewer 键盘回调 — 空格暂停作为手柄外的备用控制"""
     global paused
     if chr(keycode) == " ":
         paused = not paused
         print(f"Paused: {paused}")
 
 
-# ================= 5. 主程序 =================
+# ================= 6. 主程序 =================
 def run_simulation():
-    global cmd, default_dof_pos
+    global cmd, default_dof_pos, running
 
-    # --- 加载 YAML 配置 ---
     if not os.path.exists(YAML_PATH):
         print(f"错误: 找不到配置文件 {YAML_PATH}")
         return
@@ -135,7 +171,6 @@ def run_simulation():
     with open(YAML_PATH, "r", encoding="utf-8") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
-    # 提取参数
     sim_dt = float(config.get("simulation_dt", 0.005))
     control_decimation = int(config.get("control_decimation", 2))
     num_actions = int(config.get("num_actions", 12))
@@ -147,22 +182,15 @@ def run_simulation():
     kds = np.array(config["kds"], dtype=np.float32)
     default_dof_pos = np.array(config["default_angles"], dtype=np.float32)
 
-    # 缩放因子
-    _ = config.get("lin_vel_scale", 2.0)
     ang_vel_scale = config["ang_vel_scale"]
     dof_pos_scale = config["dof_pos_scale"]
     dof_vel_scale = config["dof_vel_scale"]
     action_scale = config["action_scale"]
     cmd_scale = np.array(config["cmd_scale"], dtype=np.float32)
-    cmd_init = np.array(config.get("cmd_init", [0.0, 0.0, 0.0]), dtype=np.float32)
 
     if len(default_dof_pos) != num_actions or len(kps) != num_actions or len(kds) != num_actions:
         print("错误: YAML 中 num_actions 与 kps/kds/default_angles 维度不一致")
         return
-    if len(cmd_init) != 3:
-        print("错误: YAML 中 cmd_init 必须是长度为 3 的向量 [vx, vy, wz]")
-        return
-    cmd[:] = cmd_init
 
     xml_path_cfg = config.get("xml_path", "")
     if xml_path_cfg:
@@ -172,7 +200,6 @@ def run_simulation():
 
     print(f"XML : {xml_path}")
 
-    # --- 加载 MuJoCo & ONNX ---
     if not os.path.exists(xml_path):
         print(f"错误: 找不到模型文件 {xml_path}")
         return
@@ -204,27 +231,32 @@ def run_simulation():
     target_dof_pos = default_dof_pos.copy()
     action = np.zeros(num_actions, dtype=np.float32)
 
-    # 键盘监听
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-    print("仿真开始！↑↓ 前进/后退  ←→ 左转/右转  Ctrl+←→ 左/右平移  空格 暂停")
+    print("仿真开始！XBOX 手柄控制模式。")
+    print("  左摇杆: 前进/后退 + 左/右平移")
+    print("  右摇杆: 左转/右转")
+    print("  START: 暂停  BACK: 退出  空格: 暂停(备用)")
 
     history_len = max(1, num_obs // num_one_step_obs)
     obs_dim = num_one_step_obs
-    obs_history_buffer = deque([np.zeros(obs_dim, dtype=np.float32) for _ in range(history_len)], maxlen=history_len)
+    obs_history_buffer = deque(
+        [np.zeros(obs_dim, dtype=np.float32) for _ in range(history_len)],
+        maxlen=history_len,
+    )
 
-    # --- 仿真循环 ---
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         step_counter = 0
-        while viewer.is_running():
+        while viewer.is_running() and running:
             step_start = time.time()
 
+            # 读取手柄
+            if not poll_joystick():
+                break
+
             if not paused:
-                # ================= 策略控制 =================
                 if step_counter % control_decimation == 0:
                     qj = data.qpos[7:7 + num_actions]
                     dqj = data.qvel[6:6 + num_actions]
-                    quat = data.qpos[3:7]  # [w, x, y, z]
+                    quat = data.qpos[3:7]
 
                     if use_gyro_sensor:
                         omega = data.sensor("angular-velocity").data.astype(np.float32)
@@ -239,7 +271,6 @@ def run_simulation():
                     omega_norm = omega * ang_vel_scale
                     cmd_norm = cmd * cmd_scale
 
-                    # 观测顺序: Cmd(3) + AngVel(3) + Gravity(3) + DofPos(12) + DofVel(12) + LastAction(12)
                     obs_raw = np.concatenate(
                         [cmd_norm, omega_norm, proj_gravity, qj_norm, dqj_norm, action],
                         axis=0,
@@ -257,7 +288,6 @@ def run_simulation():
                     action = raw_action
                     target_dof_pos = raw_action * action_scale + default_dof_pos
 
-                # ================= 物理执行 =================
                 tau = pd_control(
                     target_dof_pos,
                     data.qpos[7:7 + num_actions],
@@ -280,10 +310,12 @@ def run_simulation():
 
             viewer.sync()
 
-            # 帧率同步
             time_until_next_step = model.opt.timestep - (time.time() - step_start)
             if time_until_next_step > 0:
                 time.sleep(time_until_next_step)
+
+    if pygame:
+        pygame.quit()
 
 
 if __name__ == "__main__":
