@@ -9,7 +9,7 @@ simulation_dt: 0.005
 control_decimation: 2
 
 # 顺序: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
-kps: [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+kps: [12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12]
 kds: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
 # FL FR
@@ -22,7 +22,7 @@ lin_vel_scale: 2.0
 ang_vel_scale: 0.25
 dof_pos_scale: 1.0
 dof_vel_scale: 0.05
-action_scale: 0.25
+action_scale: 0.30
 cmd_scale: [2.0, 2.0, 0.25]
 
 # 动作与观测维度
