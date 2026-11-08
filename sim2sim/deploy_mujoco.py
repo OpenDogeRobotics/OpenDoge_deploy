@@ -11,14 +11,32 @@ deploy_mujoco.py — OpenDoge MuJoCo 仿真测试
 与 C++ 固件 (main.cpp) 保持一致：
   - 12 关节顺序：FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf,
                   RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf
-  - 默认姿态：{0, 0.5, -1.3} (前腿), {0, 0.7, -1.3} (后腿)
-  - PD 增益：kp=20, kd=0.3, safe_kd=2.0
+  - 默认姿态：每腿 {0, 0.8, -1.6} (固件 URDF 约定)
+  - PD 增益：kp=12, kd=0.5, safe_kd=2.0 (LainLab BuiltinPositionActuator)
   - 动作缩放：action_scale=0.25
+  - 观测：48 维 LainLab actor obs (含 base_lin_vel)
   - 斜坡时长：pc_startup_ramp_s=2.0
 
 用法:
-  python3 deploy_mujoco.py --policy policy/opendoge_r5.onnx  # idle 起步, 手动走完整流程
-  python3 deploy_mujoco.py --mode rl --policy policy/opendoge_r5.onnx  # 直接进入 RL
+  纯虚拟仿真手柄操作
+  cd Lain_Code/sim2sim
+  python3 deploy_mujoco.py --joystick \
+  --model ../../LainLab/src/assets/robots/opendoge/xmls/scene_opendoge.xml \
+  --joint-convention training \
+  --policy ../../LainLab/src/baseline/opendoge/flat/policy.onnx \
+  --mode idle
+  不填写参数 --model 需要填写为 ../../LainLab/src/assets/robots/opendoge/xmls/scene_opendoge.xml
+            不填写则会出错，因为默认使用了 项目根目录下存在的scene.xml 详细可以看find_model_path函数的定义
+            **如果要进行scene.xml的更改需要进行多个xml和stl的移植，较为麻烦这里建议显示指定xml**
+           --mode 默认为 idle 趴伏状态
+           --policy 默认为 ../../LainLab/src/baseline/opendoge/flat/policy.onnx 最新的策略
+           --joystick/--keyboard 操作方式 有键盘和手柄 默认为手柄
+           --joint-convention training 不填默认为固件机械限位，填写时为LainLab下的URDF映射固件限位
+  
+  旧版指令 还保留了旧版policy 核心代码已经更改 只能做test里的测试
+  python3 deploy_mujoco.py --policy policy/opendoge_flat.onnx  # idle 起步, 手动走完整流程
+  python3 deploy_mujoco.py --mode rl --policy policy/opendoge_flat.onnx  # 直接进入 RL
+  python3 deploy_mujoco.py --joystick --policy policy/opendoge_flat.onnx  # 手柄控制
   python3 deploy_mujoco.py --no-render --duration 10          # headless 测试
 
 完整手动流程 (键盘):
@@ -68,13 +86,32 @@ except ImportError:
     mujoco_viewer = None
     print("[WARN] mujoco 未安装。运行: pip install mujoco", file=sys.stderr)
 
+# ─── 尝试导入实机手柄映射 (与 hardware/gamepad 共用同一实现) ────────
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_GAMEPAD_DIR = os.path.join(_REPO_ROOT, "hardware", "gamepad")
+try:
+    if _GAMEPAD_DIR not in sys.path:
+        sys.path.insert(0, _GAMEPAD_DIR)
+    from opendoge_joystick import (  # noqa: E402
+        JS_EVENT_AXIS,
+        JS_EVENT_BUTTON,
+        DeviceLostError,
+        LinuxJoystick,
+        XboxCommandMapper,
+        first_joystick_device,
+    )
+    HAS_JOYSTICK = True
+except Exception as _joy_exc:  # pragma: no cover - 仅缺少文件时触发
+    HAS_JOYSTICK = False
+    _JOYSTICK_IMPORT_ERROR = _joy_exc
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 常量 (与 types.hpp 保持一致)
 # ══════════════════════════════════════════════════════════════════════
 
 NUM_JOINTS = 12
-OBS_DIM = 49
+OBS_DIM = 48
 
 JOINT_NAMES = [
     "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -83,19 +120,28 @@ JOINT_NAMES = [
     "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
 ]
 
-# 站立默认姿态 (rad) — 与 UniLab scene_flat.xml keyframe 一致
-# 策略以此位姿训练, 用于观测计算和目标位置基准
-# Front/rear asymmetry is intentional — centres CoM between legs
+# 训练 URDF ↔ 固件 URDF 符号约定 (与 types.hpp kJointSign 一致)。
+# LainLab 模型中 FR/RR 腿镜像 (thigh/calf axis 0 -1 0)，RL/RR hip 镜像。
+#   q_train = JOINT_SIGN * q_firmware
+# 观测/动作在训练空间计算，目标位置再映射回固件空间。
+JOINT_SIGN = np.array([
+    +1, +1, +1,   # FL
+    +1, -1, -1,   # FR
+    -1, +1, +1,   # RL
+    -1, -1, -1,   # RR
+], dtype=float)
+
+# 站立默认姿态 (rad, 固件 URDF 约定) — LainLab OPENDOGE_INIT_STATE
+# 经 JOINT_SIGN 映射后四条腿一致。
 DEFAULT_POS = np.array([
-    0.0, 0.5, -1.3,   # FL
-    0.0, 0.5, -1.3,   # FR
-    0.0, 0.7, -1.3,   # RL
-    0.0, 0.7, -1.3,   # RR
+    0.0, 0.8, -1.6,   # FL
+    0.0, 0.8, -1.6,   # FR
+    0.0, 0.8, -1.6,   # RL
+    0.0, 0.8, -1.6,   # RR
 ])
 
-# 自然趴伏姿态 (rad) — 关节失能、纯阻尼稳态在平地上
+# 自然趴伏姿态 (rad, 固件 URDF 约定) — 关节失能、纯阻尼稳态在平地上
 # 用于 Ready 态的初始位置, 不参与观测/目标计算
-# 实测: base/hip/calf mesh 碰撞 + 脚球, thigh visual only
 REST_POSE = np.array([
     0.230,  1.079, -2.681,   # FL
    -0.230,  1.079, -2.681,   # FR
@@ -103,22 +149,50 @@ REST_POSE = np.array([
    -0.230,  1.084, -2.681,   # RR
 ])
 
-# 关节限位 (rad) — 与 URDF/deploy config 一致
-JOINT_LOWER = np.array([
-    -0.785, -0.785, -2.68,   # FL
-    -0.26,  -0.785, -2.68,   # FR
-    -0.785, -0.785, -2.68,   # RL
-    -0.26,  -0.785, -2.68,   # RR
+# 固件 URDF 关节限位 (rad, 固件约定)。
+# 2026-11-06 (修改 54): 已对齐 LainLab 训练限位和实机手掰可用范围，
+# 与 deploy/configs/opendoge_deploy.conf 保持一致；旧的
+# hip 0.26/0.785、thigh 1.134 比训练窄，会让策略目标在 clamp 处饱和。
+FIRMWARE_JOINT_LOWER = np.array([
+    -1.0000, -1.0468, -2.68,   # FL
+    -0.5218, -1.0468, -2.68,   # FR
+    -0.9000, -0.8500, -2.68,   # RL
+    -0.5218, -0.8500, -2.68,   # RR
 ])
 
-JOINT_UPPER = np.array([
-    0.26,  1.134, -1.04,     # FL
-    0.785, 1.134, -1.04,     # FR
-    0.26,  1.134, -1.04,     # RL
-    0.785, 1.134, -1.04,     # RR
+FIRMWARE_JOINT_UPPER = np.array([
+    0.5218, 1.3958, -1.04,     # FL
+    1.0000, 1.3958, -1.04,     # FR
+    0.5218, 1.3958, -1.04,     # RL
+    0.9300, 1.3958, -1.04,     # RR
 ])
+
+# LainLab URDF 关节限位映射到固件约定 (JOINT_SIGN * training_limits)。
+# 仅在使用 LainLab 模型做策略消融时使用；实机部署仍用固件机械限位。
+TRAINING_JOINT_LOWER = np.array([
+    -1.0468, -1.0468, -2.68,   # FL
+    -0.5218, -1.0468, -2.68,   # FR
+    -1.0468, -1.0468, -2.68,   # RL
+    -0.5218, -1.0468, -2.68,   # RR
+])
+
+TRAINING_JOINT_UPPER = np.array([
+    0.5218, 1.3958, -1.04,     # FL
+    1.0468, 1.3958, -1.04,     # FR
+    0.5218, 1.3958, -1.04,     # RL
+    1.0468, 1.3958, -1.04,     # RR
+])
+
+# 默认使用固件机械限位；--joint-convention training 时切换
+JOINT_LOWER = FIRMWARE_JOINT_LOWER.copy()
+JOINT_UPPER = FIRMWARE_JOINT_UPPER.copy()
 
 MAX_POSITION_STEP = 0.015   # rad/target_tick @ 200Hz = 3 rad/s
+# LowGainTest stand-up slew (matches DeployConfig::low_gain_max_position_step).
+# The target is snapshotted from the measured pose on entry, so this is a ramp.
+LOW_GAIN_MAX_POSITION_STEP = 0.002   # @200Hz = 0.4 rad/s
+# Stand-up from a prone/far pose (matches DeployConfig::standup_max_position_step).
+STANDUP_MAX_POSITION_STEP = 0.002    # @200Hz = 0.4 rad/s
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -133,6 +207,7 @@ class RuntimeState(Enum):
     ActiveRL = 4
     LowGainTest = 5
     DampingFault = 6
+    StandingUp = 7
 
 
 @dataclass
@@ -140,12 +215,24 @@ class DeployConfig:
     inference_hz: float = 100.0
     target_hz: float = 200.0
     control_hz: float = 1000.0
-    kp: float = 20.0
-    kd: float = 0.3  # 与训练配置一致 (OpenDoge ControlConfig)
+    kp: float = 12.0  # LainLab BuiltinPositionActuatorCfg.stiffness
+    kd: float = 0.5   # LainLab BuiltinPositionActuatorCfg.damping
     safe_kd: float = 2.0
     action_scale: float = 0.25
     pc_startup_ramp_s: float = 2.0
     pc_startup_max_deviation: float = 2.0  # MuJoCo 从 REST_POSE (~2 rad from stand) 启动，需大容差。硬件侧为 0.25 (C++ config)
+    standup_duration_s: float = 4.0       # 趴伏/远离站姿起身时长
+    standup_settle_s: float = 1.0         # 斜坡到位后保持默认姿态的稳定时间
+    standup_handover_s: float = 1.0       # 交接后策略目标从默认姿态淡入的时长
+    # Investigation-only sensor delay/loss models. They are applied to the
+    # observation path only; the plant/PD still uses current state.
+    imu_delay_ms: float = 0.0
+    joint_delay_ms: float = 0.0
+    packet_loss: float = 0.0
+    loss_burst_ms: float = 0.0
+    loss_target: str = "joint"  # joint|bus|all
+    cmd_loss: float = 0.0
+    lin_vel_mode: str = "true"  # true|zero|command|noisy — base_lin_vel 消融
 
 
 @dataclass
@@ -162,6 +249,7 @@ class OperatorCommand:
 
 @dataclass
 class ImuSample:
+    linear_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
     angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
     projected_gravity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -1.0]))
     valid: bool = False
@@ -190,41 +278,41 @@ def build_observation(
     last_action: np.ndarray,
     command: OperatorCommand,
     imu: ImuSample,
-    phase: float,
 ) -> np.ndarray:
-    """构建 49 维观测 — 与 main.cpp buildObservation() 一致"""
+    """构建 48 维观测 — 与 main.cpp buildObservation() 一致。
+
+    joint_positions/joint_velocities/default_pos 为固件 URDF 约定；
+    观测中的关节项通过 JOINT_SIGN 转换到 LainLab 训练约定。
+    """
     obs = np.zeros(OBS_DIM)
     offset = 0
 
-    # 1. gyro (3)
+    # 1. base_lin_vel (3)
+    obs[offset:offset+3] = imu.linear_velocity
+    offset += 3
+
+    # 2. base_ang_vel (3)
     obs[offset:offset+3] = imu.angular_velocity
     offset += 3
 
-    # 2. projected_gravity (3)
+    # 3. projected_gravity (3)
     obs[offset:offset+3] = imu.projected_gravity
     offset += 3
 
-    # 3. dof_pos - default_pos (12)
-    obs[offset:offset+NUM_JOINTS] = joint_positions - default_pos
+    # 4. joint_pos_rel (12) — training convention
+    obs[offset:offset+NUM_JOINTS] = JOINT_SIGN * (joint_positions - default_pos)
     offset += NUM_JOINTS
 
-    # 4. dof_vel (12) — raw velocity, no scaling (matches C++ observer.cpp)
-    obs[offset:offset+NUM_JOINTS] = joint_velocities
+    # 5. joint_vel_rel (12) — raw velocity, training convention
+    obs[offset:offset+NUM_JOINTS] = JOINT_SIGN * joint_velocities
     offset += NUM_JOINTS
 
-    # 5. last_action (12)
+    # 6. last_action (12) — raw policy output, no clipping
     obs[offset:offset+NUM_JOINTS] = last_action
     offset += NUM_JOINTS
 
-    # 6. commands (3)
+    # 7. command (3)
     obs[offset:offset+3] = [command.vx, command.vy, command.yaw_rate]
-    offset += 3
-
-    # 7. feet_phase (4)
-    obs[offset + 0] = phase
-    obs[offset + 1] = math.fmod(phase + 0.5, 1.0)
-    obs[offset + 2] = math.fmod(phase + 0.5, 1.0)
-    obs[offset + 3] = phase
 
     return obs
 
@@ -236,9 +324,26 @@ def build_observation(
 class OpenDogeSimulator:
     """OpenDoge MuJoCo 仿真器"""
 
-    def __init__(self, model_path: str, render: bool = True, key_callback=None):
+    def __init__(
+        self,
+        model_path: str,
+        render: bool = True,
+        key_callback=None,
+        joint_convention: str = "firmware",
+    ):
         if not HAS_MUJOCO:
             raise RuntimeError("MuJoCo 未安装: pip install mujoco")
+
+        # firmware: docs/URDF/xml (all joints +axis, 固件约定)
+        # training: LainLab mjlab XML (FR/RR mirrored, 训练约定)
+        if joint_convention not in ("firmware", "training"):
+            raise ValueError("joint_convention must be 'firmware' or 'training'")
+        self.joint_convention = joint_convention
+        # model joint angle → firmware logical angle
+        self._model_sign = (
+            np.ones(NUM_JOINTS) if joint_convention == "firmware"
+            else JOINT_SIGN.copy()
+        )
 
         self.render_enabled = render
         self.model = mujoco.MjModel.from_xml_path(model_path)
@@ -254,26 +359,50 @@ class OpenDogeSimulator:
                 jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
             except Exception:
                 raise RuntimeError(f"MuJoCo 模型中找不到关节: {name}")
+            if jid < 0:
+                raise RuntimeError(f"MuJoCo 模型中找不到关节: {name}")
             self._qpos_adr[i] = self.model.jnt_qposadr[jid]
             self._dof_adr[i] = self.model.jnt_dofadr[jid]
-            # 查找对应的 actuator
-            try:
-                aid = mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name
-                )
-            except Exception:
+            # 查找对应的 actuator (LainLab XML 无 actuator，需用 qfrc_applied)
+            aid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name
+            )
+            if aid < 0 and i < self.model.nu:
                 aid = i  # fallback: 顺序匹配
             self._actuator_ids[i] = aid
+        self._has_actuators = bool(
+            self.model.nu >= NUM_JOINTS
+            and np.all(self._actuator_ids >= 0)
+        )
 
-        # 传感器地址
-        try:
-            self._gyro_adr = self.model.sensor("angular-velocity").id
-            self._quat_adr = self.model.sensor("orientation").id
-            self._has_sensors = True
-        except Exception:
-            self._gyro_adr = 0
-            self._quat_adr = 0
-            self._has_sensors = False
+        # LainLab 的 armature 由 mjlab BuiltinPositionActuatorCfg 在运行时注入
+        # (armature=0.005)，XML 本身没有。缺少它会因 calf 惯量极小而导致
+        # 显式积分发散 (ω·dt > 2)。
+        if joint_convention == "training" and not self._has_actuators:
+            self.model.dof_armature[self._dof_adr] = 0.005
+
+        # 传感器地址：必须用 sensor_adr（sensordata 偏移），不能用 sensor id。
+        # 多分量传感器会让 id 与 adr 不同。
+        def sensor_adr(name: str) -> Optional[int]:
+            sid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_SENSOR, name
+            )
+            return None if sid < 0 else int(self.model.sensor_adr[sid])
+
+        gyro_names = ("angular-velocity", "imu_ang_vel")
+        self._gyro_adr = next(
+            (a for a in (sensor_adr(n) for n in gyro_names) if a is not None), None
+        )
+        self._quat_adr = sensor_adr("orientation")
+        self._has_sensors = self._gyro_adr is not None
+
+        # 线速度传感器: 固件 XML = "linear-velocity", LainLab XML = "imu_lin_vel"
+        self._lin_vel_adr = next(
+            (a for a in (
+                sensor_adr("linear-velocity"), sensor_adr("imu_lin_vel")
+            ) if a is not None),
+            None,
+        )
 
         # 渲染
         if self.render_enabled:
@@ -286,17 +415,17 @@ class OpenDogeSimulator:
         self.step_count = 0
 
     def get_joint_positions(self) -> np.ndarray:
-        """读取 12 个关节的当前位置 (rad) — 使用 jnt_qposadr"""
+        """读取 12 个关节位置 (rad), 返回固件约定 — 使用 jnt_qposadr"""
         q = np.zeros(NUM_JOINTS)
         for i in range(NUM_JOINTS):
-            q[i] = self.data.qpos[self._qpos_adr[i]]
+            q[i] = self._model_sign[i] * self.data.qpos[self._qpos_adr[i]]
         return q
 
     def get_joint_velocities(self) -> np.ndarray:
-        """读取 12 个关节的当前速度 (rad/s) — 使用 jnt_dofadr"""
+        """读取 12 个关节速度 (rad/s), 返回固件约定 — 使用 jnt_dofadr"""
         dq = np.zeros(NUM_JOINTS)
         for i in range(NUM_JOINTS):
-            dq[i] = self.data.qvel[self._dof_adr[i]]
+            dq[i] = self._model_sign[i] * self.data.qvel[self._dof_adr[i]]
         return dq
 
     def apply_pd_control(
@@ -305,24 +434,40 @@ class OpenDogeSimulator:
         kp_gains: np.ndarray,
         kd_gains: np.ndarray,
     ):
-        """施加 PD 控制：力矩 = kp*(target - q) - kd*dq, 写入 data.ctrl"""
+        """施加 PD 控制：力矩 = kp*(target - q) - kd*dq, 写入 data.ctrl。
+
+        targets 为固件约定；q/dq 读取时已映射到固件约定，力矩再映射回模型约定。
+        """
         q = self.get_joint_positions()
         dq = self.get_joint_velocities()
         torque = kp_gains * (targets - q) - kd_gains * dq
         for i in range(NUM_JOINTS):
-            self.data.ctrl[self._actuator_ids[i]] = torque[i]
+            tau_model = self._model_sign[i] * torque[i]
+            if self._has_actuators:
+                self.data.ctrl[self._actuator_ids[i]] = tau_model
+            else:
+                self.data.qfrc_applied[self._dof_adr[i]] = tau_model
 
     def reset_to_rest_pose(self):
         """将机器人重置到自然趴伏姿态 (Ready 态初始位)"""
         mujoco.mj_resetData(self.model, self.data)
         for i in range(NUM_JOINTS):
-            self.data.qpos[self._qpos_adr[i]] = REST_POSE[i]
+            self.data.qpos[self._qpos_adr[i]] = self._model_sign[i] * REST_POSE[i]
         self.data.qpos[2] = 0.05  # 趴伏 base 贴近地面
+        mujoco.mj_forward(self.model, self.data)
+
+    def reset_to_default_pose(self, base_height: float = 0.158):
+        """重置到站立默认姿态 (用于无键盘消融实验)。"""
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[0:3] = [0.0, 0.0, base_height]
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        for i in range(NUM_JOINTS):
+            self.data.qpos[self._qpos_adr[i]] = self._model_sign[i] * DEFAULT_POS[i]
         mujoco.mj_forward(self.model, self.data)
 
     @staticmethod
     def _rotate_vector_by_quat(v: np.ndarray, q: np.ndarray) -> np.ndarray:
-        """用四元数 q=[w,x,y,z] 旋转向量 v: q * v * q^-1"""
+        """用四元数 q=[w,x,y,z] 旋转向量 v: q * v * q^-1  (即 R(q)·v)"""
         w, x, y, z = q
         t = 2.0 * (x * v[0] + y * v[1] + z * v[2])
         t2 = w * w - (x * x + y * y + z * z)
@@ -332,6 +477,21 @@ class OpenDogeSimulator:
             t * z + t2 * v[2] + 2.0 * w * (x * v[1] - y * v[0]),
         ])
 
+    @staticmethod
+    def _rotate_vector_by_quat_inverse(v: np.ndarray, q: np.ndarray) -> np.ndarray:
+        """q^-1 * v * q (即 R(q)^T·v)，与 mjlab quat_apply_inverse 一致。"""
+        w, x, y, z = q
+        t = 2.0 * np.array([
+            y * v[2] - z * v[1],
+            z * v[0] - x * v[2],
+            x * v[1] - y * v[0],
+        ])
+        return v - w * t + np.array([
+            y * t[2] - z * t[1],
+            z * t[0] - x * t[2],
+            x * t[1] - y * t[0],
+        ])
+
     def get_imu(self) -> ImuSample:
         """读取 IMU 传感器数据 — 用 framequat 计算 projected_gravity 与训练一致"""
         imu = ImuSample()
@@ -339,14 +499,28 @@ class OpenDogeSimulator:
             imu.angular_velocity = self.data.sensordata[
                 self._gyro_adr:self._gyro_adr + 3
             ].copy()
-            # 用 IMU 姿态四元数将世界系重力 [0,0,-1] 旋转到机体坐标系
-            quat = self.data.sensordata[
-                self._quat_adr:self._quat_adr + 4
-            ].copy()  # [w, x, y, z]
-            imu.projected_gravity = self._rotate_vector_by_quat(
+            # 用姿态四元数将世界系重力 [0,0,-1] 旋转到机体坐标系。
+            # 有 framequat 时用传感器，否则用 floating base 的 qpos 四元数。
+            if self._quat_adr is not None:
+                quat = self.data.sensordata[
+                    self._quat_adr:self._quat_adr + 4
+                ].copy()  # [w, x, y, z]
+            else:
+                quat = self.data.qpos[3:7].copy()  # free joint [w, x, y, z]
+            # 训练侧 mjlab: projected_gravity_b = R^T · (0,0,-1)
+            # （quat_apply_inverse(root_link_quat_w, gravity_vec_w)）。
+            # framequat / qpos 四元数是 body->world，所以这里必须用逆旋转；
+            # 旧代码用正向 R·g，会把 gx/gy 的符号翻反（低头时 gx 变负）。
+            imu.projected_gravity = self._rotate_vector_by_quat_inverse(
                 np.array([0.0, 0.0, -1.0]), quat
             )
             imu.valid = True
+        # base_lin_vel (body/site frame). Present in both XMLs; the controller
+        # may override it depending on --lin-vel-mode.
+        if self._lin_vel_adr is not None:
+            imu.linear_velocity = self.data.sensordata[
+                self._lin_vel_adr:self._lin_vel_adr + 3
+            ].copy()
         return imu
 
     def step(self):
@@ -441,10 +615,12 @@ class KeyboardHandler:
     GLFW 键码参考:
       ESC=256, Q=81, Backspace=259, Space=32
       A=65, B=66, X=88, Y=89
-      上=265, 下=266, 左=263, 右=262
+      上=265, 下=264, 左=263, 右=262  (GLFW: UP=265, DOWN=264)
     """
 
-    def __init__(self):
+    def __init__(self, quit_only: bool = False):
+        # quit_only=True: 只响应 Esc/Q，其余按键交给手柄输入源
+        self.quit_only = quit_only
         self.active_requested = False
         self.estop = False
         self.position_control = False
@@ -468,6 +644,8 @@ class KeyboardHandler:
         self._pending_keys.clear()
 
     def _handle_key(self, keycode: int):
+        if self.quit_only and keycode not in (256, 257, 81):
+            return
         if keycode in (256, 257, 81):  # ESC, GLFW_ESCAPE, Q
             self.should_quit = True
             print(f"[KEY] 退出 (key={keycode})")
@@ -520,7 +698,7 @@ class KeyboardHandler:
         elif keycode == 265:  # ↑ 前进
             self._arrow_vx = 0.6
             print(f"[KEY] ↑ vx=+{self._arrow_vx}")
-        elif keycode == 266:  # ↓ 后退
+        elif keycode == 264:  # ↓ 后退 (GLFW_KEY_DOWN = 264, not 266)
             self._arrow_vx = -0.4
             print(f"[KEY] ↓ vx={self._arrow_vx}")
         elif keycode == 263:  # ← 左移
@@ -556,6 +734,99 @@ class KeyboardHandler:
         return cmd
 
 
+class JoystickHandler:
+    """把 /dev/input/js* 手柄接入仿真，与实机 bridge 使用同一套映射。
+
+    接口与 KeyboardHandler 对齐 (process_keys / get_command / should_quit)，
+    DeployController 无需区分输入源。
+    """
+
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        *,
+        axis_vx: int = 1,
+        axis_vy: int = 0,
+        axis_yaw: int = 2,
+        # 默认匹配 Zikway HID gamepad (3537:1041):
+        #   A=0 B=1 X=3 Y=4, START=LB(6), BACK=RB(7)
+        # 该手柄没有独立 START 键；Home=btn12，但长按会关机，故默认用 LB 代替。
+        # 如需改用 Home，将下面 btn_start 改为 12（或传 --joy-btn-start 12）:
+        # btn_start: int = 12,  # Home
+        btn_a: int = 0,
+        btn_b: int = 1,
+        btn_x: int = 3,
+        btn_y: int = 4,
+        btn_back: int = 7,
+        btn_start: int = 6,
+        debug: bool = False,
+    ):
+        if not HAS_JOYSTICK:
+            raise RuntimeError(
+                f"无法导入 hardware/gamepad/opendoge_joystick.py: {_JOYSTICK_IMPORT_ERROR}"
+            )
+        self.device = device or first_joystick_device()
+        if not self.device:
+            raise FileNotFoundError(
+                "未找到 /dev/input/js* 手柄设备。插入接收器后确认 ls /dev/input/js*"
+            )
+        self.joystick = LinuxJoystick(self.device)
+        self.joystick.open()
+        # 默认与 hardware/gamepad/xbox_command_bridge.py 一致；
+        # 不同手柄可用 --joy-* 参数重映射。
+        self.mapper = XboxCommandMapper(
+            max_vx=0.6, max_vy=0.4, max_yaw_rate=1.0, deadzone=0.08,
+            axis_vy=axis_vy, axis_vx=axis_vx, axis_yaw=axis_yaw,
+            btn_a=btn_a, btn_b=btn_b, btn_x=btn_x, btn_y=btn_y,
+            btn_back=btn_back, btn_start=btn_start,
+        )
+        self.should_quit = False
+        self._lost = False
+        self.debug = debug
+        print(f"[JOY] {self.device} ({self.joystick.name()})")
+
+    def process_keys(self):
+        """非阻塞读取手柄事件 (命名与 KeyboardHandler 保持一致)。"""
+        try:
+            events = self.joystick.read_events()
+            if self.debug:
+                for e in events:
+                    if e.base_type == JS_EVENT_BUTTON:
+                        kind = "BTN "
+                    elif e.base_type == JS_EVENT_AXIS:
+                        kind = "AXIS"
+                    else:
+                        kind = "EV  "
+                    print(f"[JOY] {kind} {e.number:2d} = {e.value:6d}")
+            self.mapper.update(events)
+            self._lost = False
+        except DeviceLostError:
+            if not self._lost:
+                print("\n[JOY] 手柄设备丢失，强制 active=false")
+                self.mapper.active_requested = False
+                self.mapper.position_control = False
+                self.mapper.rl_inference = False
+                self._lost = True
+
+    def get_command(
+        self, vx: float = 0.0, vy: float = 0.0, yaw_rate: float = 0.0
+    ) -> OperatorCommand:
+        c = self.mapper.command()
+        return OperatorCommand(
+            vx=c.vx,
+            vy=c.vy,
+            yaw_rate=c.yaw_rate,
+            active=c.active,
+            estop=c.estop,
+            position_control=c.position_control,
+            rl_inference=c.rl_inference,
+            low_gain_mode=c.low_gain_mode,
+        )
+
+    def close(self):
+        self.joystick.close()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 日志记录
 # ══════════════════════════════════════════════════════════════════════
@@ -566,7 +837,8 @@ class DeployLogger:
     COLUMNS = [
         "t", "state", "fault",
         "cmd_vx", "cmd_vy", "cmd_yaw", "cmd_active", "cmd_pos", "cmd_rl",
-        "z", "phase", "rl_fb",
+        "z", "base_x", "base_y", "base_yaw",
+        "true_vx", "true_vy", "true_wz", "phase", "rl_fb",
         # 12 joints × {q, dq, target, action, kp, kd, torque}
         *[f"{j}_{s}" for j in JOINT_NAMES for s in (
             "q", "dq", "target", "action", "kp", "kd", "torque",
@@ -595,6 +867,11 @@ class DeployLogger:
         kp: np.ndarray,
         kd: np.ndarray,
         z: float,
+        base_x: float,
+        base_y: float,
+        base_yaw: float,
+        true_lin_vel: np.ndarray,
+        true_wz: float,
         phase: float,
         rl_fallback: bool,
         torque: np.ndarray,
@@ -606,7 +883,9 @@ class DeployLogger:
             f"{t:.6f}", state.name, int(fault_latched),
             f"{command.vx:.4f}", f"{command.vy:.4f}", f"{command.yaw_rate:.4f}",
             int(command.active), int(command.position_control), int(command.rl_inference),
-            f"{z:.6f}", f"{phase:.4f}", int(rl_fallback),
+            f"{z:.6f}", f"{base_x:.6f}", f"{base_y:.6f}", f"{base_yaw:.6f}",
+            f"{true_lin_vel[0]:.6f}", f"{true_lin_vel[1]:.6f}", f"{true_wz:.6f}",
+            f"{phase:.4f}", int(rl_fallback),
         ]
         for i in range(NUM_JOINTS):
             row += [
@@ -637,6 +916,8 @@ class DeployController:
         static_vy: float = 0.0,
         static_yaw: float = 0.0,
         logger: Optional["DeployLogger"] = None,
+        lin_vel_mode: Optional[str] = None,
+        seed: int = 0,
     ):
         self.sim = sim
         self.config = config
@@ -646,6 +927,23 @@ class DeployController:
         self.static_vy = static_vy
         self.static_yaw = static_yaw
         self.logger = logger
+        self.lin_vel_mode = lin_vel_mode or config.lin_vel_mode
+        if self.lin_vel_mode not in ("true", "zero", "command", "noisy"):
+            raise ValueError(
+                "lin_vel_mode must be one of true|zero|command|noisy, "
+                f"got {self.lin_vel_mode!r}"
+            )
+        self._rng = np.random.default_rng(seed)
+        # Sensor history / loss state for --imu-delay-ms/--joint-delay-ms/
+        # --packet-loss/--cmd-loss. The history is observation-only.
+        self._sensor_history = []
+        self._loss_rng = np.random.default_rng(seed + 0x5EED)
+        self._loss_remaining = np.zeros(NUM_JOINTS)
+        self._loss_remaining_bus = np.zeros(4)
+        self._loss_hold_q = None
+        self._loss_hold_dq = None
+        self._cmd_loss_remaining = 0.0
+        self._applied_target = DEFAULT_POS.copy()
 
         # 状态机变量
         self.runtime_state = RuntimeState.WaitFeedback
@@ -660,6 +958,8 @@ class DeployController:
         self.logical_target = DEFAULT_POS.copy()
         self.limited_target = DEFAULT_POS.copy()
         self.pc_startup_start_s = 0.0
+        self.standup_start_s = 0.0
+        self.standup_handover_start_s = -1.0
 
         # 快照时间戳
         self._last_infer_tick = -1
@@ -673,6 +973,59 @@ class DeployController:
             cmd.position_control = False
         return cmd
 
+    def _resolve_linear_velocity(
+        self, true_lin_vel: np.ndarray, command: OperatorCommand
+    ) -> np.ndarray:
+        """按消融模式生成策略观测中的 base_lin_vel。"""
+        if self.lin_vel_mode == "true":
+            return true_lin_vel
+        if self.lin_vel_mode == "zero":
+            return np.zeros(3)
+        if self.lin_vel_mode == "command":
+            # 体坐标系下的期望速度 (yaw 不贡献线速度)
+            return np.array([command.vx, command.vy, 0.0])
+        # noisy: true velocity + 训练时的 U(-0.5, 0.5) m/s 噪声
+        return true_lin_vel + self._rng.uniform(-0.5, 0.5, 3)
+
+    def _delayed_snapshot(self, t: float, delay_s: float):
+        """Return the newest history entry at or before t-delay_s.
+
+        Observation-only: the PD/plant must keep using the current state.
+        """
+        if delay_s <= 0.0 or not self._sensor_history:
+            return None
+        target = t - delay_s
+        for entry in reversed(self._sensor_history):
+            if entry[0] <= target:
+                return entry
+        return self._sensor_history[0]
+
+    def _update_loss_state(self, config: DeployConfig, dt: float) -> None:
+        """Update per-joint/bus/all packet-loss hold timers (target rate)."""
+        max_burst = max(config.loss_burst_ms / 1000.0, dt)
+        if config.loss_target == "all":
+            if self._loss_remaining[0] <= 0.0 and self._loss_rng.random() < config.packet_loss:
+                self._loss_remaining[:] = max_burst
+            else:
+                self._loss_remaining[:] = np.maximum(0.0, self._loss_remaining[:] - dt)
+            return
+        if config.loss_target == "bus":
+            for b in range(4):
+                if (self._loss_remaining_bus[b] <= 0.0
+                        and self._loss_rng.random() < config.packet_loss):
+                    self._loss_remaining_bus[b] = max_burst
+                else:
+                    self._loss_remaining_bus[b] = max(
+                        0.0, self._loss_remaining_bus[b] - dt)
+            for i in range(NUM_JOINTS):
+                self._loss_remaining[i] = self._loss_remaining_bus[i // 3]
+            return
+        for i in range(NUM_JOINTS):
+            if self._loss_remaining[i] <= 0.0 and self._loss_rng.random() < config.packet_loss:
+                self._loss_remaining[i] = max_burst
+            else:
+                self._loss_remaining[i] = max(0.0, self._loss_remaining[i] - dt)
+
     def _check_startup_deviation(self) -> bool:
         """检查 ramp 期间关节偏离 DEFAULT_POS (防失控，与 C++ 一致)"""
         q = self.sim.get_joint_positions()
@@ -685,6 +1038,16 @@ class DeployController:
         """执行一个控制周期。返回 True 继续，False 退出。"""
         t = self.sim.data.time
         config = self.config
+        # Observation-only sensor history (used by the delay model). Filled
+        # every controller step so the delay resolution is the sim timestep.
+        self._sensor_history.append((
+            t,
+            self.sim.get_imu(),
+            self.sim.get_joint_positions().copy(),
+            self.sim.get_joint_velocities().copy(),
+        ))
+        if len(self._sensor_history) > 2000:
+            del self._sensor_history[:len(self._sensor_history) - 2000]
         self.keyboard.process_keys()
         command = self._get_command()
 
@@ -709,14 +1072,24 @@ class DeployController:
             # ── Ready ↔ LowGainTest ──
             if self.runtime_state == RuntimeState.Ready and command.low_gain_mode:
                 self.runtime_state = RuntimeState.LowGainTest
+                # Start the stand-up from the measured pose, not from DEFAULT_POS.
+                self.limited_target = self.sim.get_joint_positions().copy()
                 print(f"\n[{t:.3f}s] Ready → LowGainTest")
             if self.runtime_state == RuntimeState.LowGainTest and not command.low_gain_mode:
                 self.runtime_state = RuntimeState.Ready
                 print(f"\n[{t:.3f}s] LowGainTest → Ready")
 
-            # ── Ready → EnteringPosition / ActiveRL ──
+            # ── Ready → StandingUp / EnteringPosition / ActiveRL ──
             if self.runtime_state == RuntimeState.Ready and command.active:
-                if command.rl_inference:
+                if not self._check_startup_deviation():
+                    # Far from the default pose (e.g. prone): stand up first,
+                    # no policy; the target ramps from the measured pose.
+                    self.runtime_state = RuntimeState.StandingUp
+                    self.standup_start_s = t
+                    self.standup_handover_start_s = -1.0
+                    self.limited_target = self.sim.get_joint_positions().copy()
+                    print(f"\n[{t:.3f}s] Ready → StandingUp (远离站姿)")
+                elif command.rl_inference:
                     self.runtime_state = RuntimeState.ActiveRL
                     print(f"\n[{t:.3f}s] Ready → ActiveRL (RL 直跳)")
                 else:
@@ -746,6 +1119,21 @@ class DeployController:
                     elif t - self.pc_startup_start_s >= config.pc_startup_ramp_s:
                         self.runtime_state = RuntimeState.ActivePC
                         print(f"\n[{t:.3f}s] EnteringPosition → ActivePC (斜坡完成)")
+
+            # ── StandingUp: ramp to the default pose, no policy ──
+            elif self.runtime_state == RuntimeState.StandingUp:
+                if not command.active:
+                    self.runtime_state = RuntimeState.Ready
+                    print(f"\n[{t:.3f}s] StandingUp → Ready (取消)")
+                elif t - self.standup_start_s >= (
+                    config.standup_duration_s + config.standup_settle_s
+                ):
+                    self.runtime_state = (
+                        RuntimeState.ActiveRL if command.rl_inference
+                        else RuntimeState.ActivePC
+                    )
+                    self.standup_handover_start_s = t
+                    print(f"\n[{t:.3f}s] StandingUp → {self.runtime_state.name}")
 
             # ── ActivePC / ActiveRL → Ready ──
             elif (
@@ -782,14 +1170,45 @@ class DeployController:
             ):
                 self.phase = advance_phase(command, self.phase, 1.0 / config.inference_hz)
                 imu = self.sim.get_imu()
+                q_obs = self.sim.get_joint_positions()
+                dq_obs = self.sim.get_joint_velocities()
+                # Observation-only delays: never feed these into the plant/PD.
+                if config.imu_delay_ms > 0.0:
+                    snap = self._delayed_snapshot(t, config.imu_delay_ms / 1000.0)
+                    if snap is not None:
+                        src = snap[1]
+                        imu = ImuSample(
+                            linear_velocity=src.linear_velocity.copy(),
+                            angular_velocity=src.angular_velocity.copy(),
+                            projected_gravity=src.projected_gravity.copy(),
+                            valid=src.valid,
+                        )
+                if config.joint_delay_ms > 0.0:
+                    snap = self._delayed_snapshot(t, config.joint_delay_ms / 1000.0)
+                    if snap is not None:
+                        q_obs = snap[2].copy()
+                        dq_obs = snap[3].copy()
+                if config.packet_loss > 0.0:
+                    if self._loss_hold_q is None:
+                        self._loss_hold_q = q_obs.copy()
+                        self._loss_hold_dq = dq_obs.copy()
+                    for i in range(NUM_JOINTS):
+                        if self._loss_remaining[i] > 0.0:
+                            q_obs[i] = self._loss_hold_q[i]
+                            dq_obs[i] = self._loss_hold_dq[i]
+                        else:
+                            self._loss_hold_q[i] = q_obs[i]
+                            self._loss_hold_dq[i] = dq_obs[i]
+                imu.linear_velocity = self._resolve_linear_velocity(
+                    imu.linear_velocity, command
+                )
                 obs = build_observation(
-                    self.sim.get_joint_positions(),
-                    self.sim.get_joint_velocities(),
+                    q_obs,
+                    dq_obs,
                     DEFAULT_POS,
                     self.last_action,
                     command,
                     imu,
-                    self.phase,
                 )
                 success, action, error = self.policy.infer(obs)
                 if not success:
@@ -812,28 +1231,71 @@ class DeployController:
         target_tick = int(t * config.target_hz)
         if target_tick != self._last_target_tick:
             self._last_target_tick = target_tick
+            # 起身交接：第一帧策略动作可能很大，先从默认姿态淡入，
+            # 避免 calf 目标瞬跳（与 controller.cpp updateTargets 一致）。
+            handover = (
+                self.runtime_state in (RuntimeState.ActiveRL, RuntimeState.ActivePC)
+                and self.standup_handover_start_s >= 0.0
+                and t - self.standup_handover_start_s < config.standup_handover_s
+            )
+            alpha = 1.0
+            if handover:
+                alpha = min(
+                    (t - self.standup_handover_start_s)
+                    / max(config.standup_handover_s, 1e-6),
+                    1.0,
+                )
             for i in range(NUM_JOINTS):
-                self.last_action[i] = np.clip(self.action[i], -1.0, 1.0)
-                if self.runtime_state == RuntimeState.LowGainTest:
+                # 训练无裁剪；last_action 观测原始策略输出
+                self.last_action[i] = self.action[i]
+                if self.runtime_state in (RuntimeState.LowGainTest, RuntimeState.StandingUp):
                     tgt = DEFAULT_POS[i]
                 else:
-                    tgt = DEFAULT_POS[i] + self.last_action[i] * config.action_scale
+                    # 动作在训练约定，映射回固件约定
+                    tgt = (DEFAULT_POS[i]
+                           + JOINT_SIGN[i] * self.last_action[i] * config.action_scale)
                 tgt = np.clip(tgt, JOINT_LOWER[i], JOINT_UPPER[i])
                 self.logical_target[i] = tgt
+                if handover:
+                    blended = DEFAULT_POS[i] + alpha * (tgt - DEFAULT_POS[i])
+                    self.limited_target[i] = rate_limit(
+                        blended, self.limited_target[i], MAX_POSITION_STEP
+                    )
                 # RL 模式跳过 rate_limit，策略训练时目标瞬时切换，无平滑延迟
-                if self.runtime_state == RuntimeState.ActiveRL:
+                elif self.runtime_state == RuntimeState.ActiveRL:
                     self.limited_target[i] = tgt
                 else:
+                    step = MAX_POSITION_STEP
+                    if self.runtime_state == RuntimeState.LowGainTest:
+                        step = min(step, LOW_GAIN_MAX_POSITION_STEP)
+                    elif self.runtime_state == RuntimeState.StandingUp:
+                        step = min(step, STANDUP_MAX_POSITION_STEP)
                     self.limited_target[i] = rate_limit(
-                        self.logical_target[i], self.limited_target[i], MAX_POSITION_STEP
+                        self.logical_target[i], self.limited_target[i], step
                     )
+
+            # Loss models are driven at the 200 Hz target rate. A dropped
+            # command holds the last applied target (the motor keeps its last
+            # CAN command); a feedback drop holds the last observed q/dq.
+            tick = 1.0 / max(config.target_hz, 1.0)
+            if config.cmd_loss > 0.0:
+                if (self._cmd_loss_remaining <= 0.0
+                        and self._loss_rng.random() < config.cmd_loss):
+                    self._cmd_loss_remaining = max(
+                        config.loss_burst_ms / 1000.0, tick)
+                else:
+                    self._cmd_loss_remaining = max(
+                        0.0, self._cmd_loss_remaining - tick)
+            if config.packet_loss > 0.0:
+                self._update_loss_state(config, tick)
 
         # --- 控制块 (1000 Hz, 与 C++ controller.cpp computeMotorCommands 一致) ---
         is_active = self.runtime_state in (RuntimeState.ActivePC, RuntimeState.ActiveRL)
         is_ramping = self.runtime_state == RuntimeState.EnteringPosition
         is_low_gain = self.runtime_state == RuntimeState.LowGainTest
+        is_standing_up = self.runtime_state == RuntimeState.StandingUp
 
-        if not is_active and not is_ramping and not is_low_gain:
+        if not is_active and not is_ramping and not is_low_gain and not is_standing_up:
             # Ready / WaitFeedback / DampingFault: 关节全失能, 仅阻尼
             kp_gains = np.zeros(NUM_JOINTS)
             kd_gains = np.full(NUM_JOINTS, config.safe_kd)
@@ -843,6 +1305,17 @@ class DeployController:
             kp_gains = np.full(NUM_JOINTS, config.kp * 0.3)
             kd_gains = np.full(NUM_JOINTS, config.kd * 0.3)
             target_positions = DEFAULT_POS.copy()
+        elif is_standing_up:
+            # StandingUp: 30% -> full stiffness, target ramps to DEFAULT_POS
+            frac = min(
+                (t - self.standup_start_s) / max(config.standup_duration_s, 1e-6), 1.0
+            )
+            kp_gains = np.full(NUM_JOINTS, config.kp * (0.3 + 0.7 * frac))
+            kd_gains = np.full(
+                NUM_JOINTS,
+                config.safe_kd + frac * (config.kd - config.safe_kd),
+            )
+            target_positions = self.limited_target
         elif is_ramping:
             ramp_elapsed = t - self.pc_startup_start_s
             ramp_frac = min(ramp_elapsed / config.pc_startup_ramp_s, 1.0)
@@ -857,14 +1330,30 @@ class DeployController:
             kd_gains = np.full(NUM_JOINTS, config.kd)
             target_positions = self.limited_target
 
+        if config.cmd_loss > 0.0:
+            if self._cmd_loss_remaining > 0.0:
+                target_positions = self._applied_target.copy()
+            else:
+                self._applied_target = target_positions.copy()
+
         self.sim.apply_pd_control(target_positions, kp_gains, kd_gains)
 
         # ── 日志: 记录控制输出 ──────────────────────────────────────────
         if self.logger is not None:
             q = self.sim.get_joint_positions()
             dq = self.sim.get_joint_velocities()
-            torque = np.array([self.sim.data.ctrl[self.sim._actuator_ids[i]]
-                               for i in range(NUM_JOINTS)])
+            qw, qx, qy, qz = self.sim.data.qpos[3:7]
+            base_yaw = math.atan2(
+                2.0 * (qw * qz + qx * qy),
+                1.0 - 2.0 * (qy * qy + qz * qz),
+            )
+            log_imu = self.sim.get_imu()
+            if self.sim._has_actuators:
+                torque = np.array([self.sim.data.ctrl[self.sim._actuator_ids[i]]
+                                   for i in range(NUM_JOINTS)])
+            else:
+                torque = np.array([self.sim.data.qfrc_applied[self.sim._dof_adr[i]]
+                                   for i in range(NUM_JOINTS)])
             self.logger.record(
                 t=t,
                 state=self.runtime_state,
@@ -875,6 +1364,11 @@ class DeployController:
                 action=self.last_action,
                 kp=kp_gains, kd=kd_gains,
                 z=self.sim.data.qpos[2],
+                base_x=self.sim.data.qpos[0],
+                base_y=self.sim.data.qpos[1],
+                base_yaw=base_yaw,
+                true_lin_vel=log_imu.linear_velocity,
+                true_wz=log_imu.angular_velocity[2],
                 phase=self.phase,
                 rl_fallback=self.rl_fallback_active,
                 torque=torque,
@@ -934,6 +1428,9 @@ def find_model_path() -> str:
         "请使用 --model 参数指定路径。"
     )
 
+"""
+脚本填写参数声明区，不懂的怎么填写的时候记得来看看，或是要增加参数时
+"""
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -967,6 +1464,26 @@ def parse_args():
     )
     p.add_argument("--no-render", action="store_true", help="无渲染模式")
     p.add_argument(
+        "--joystick", nargs="?", const="auto", default=None,
+        metavar="DEVICE",
+        help="使用 /dev/input/js* 手柄控制 (与实机同一映射)。"
+             "不带值自动选择第一个设备，也可指定 /dev/input/js0"
+    )
+    # 手柄映射覆盖 (默认值与实机 bridge 一致)
+    p.add_argument("--joy-axis-vx", type=int, default=1, help="vx 轴号 (默认 1)")
+    p.add_argument("--joy-axis-vy", type=int, default=0, help="vy 轴号 (默认 0)")
+    p.add_argument("--joy-axis-yaw", type=int, default=2, help="yaw 轴号 (默认 2)")
+    p.add_argument("--joy-btn-a", type=int, default=0, help="A 键号 (默认 0)")
+    p.add_argument("--joy-btn-b", type=int, default=1, help="B 键号 (默认 1)")
+    p.add_argument("--joy-btn-x", type=int, default=3, help="X 键号 (默认 3)")
+    p.add_argument("--joy-btn-y", type=int, default=4, help="Y 键号 (默认 4)")
+    p.add_argument("--joy-btn-back", type=int, default=7,
+                   help="BACK/low_gain 键号 (默认 7 = RB)")
+    p.add_argument("--joy-btn-start", type=int, default=6,
+                   help="START/使能 键号 (默认 6 = LB；Home=12，长按会关机)")
+    p.add_argument("--joy-debug", action="store_true",
+                   help="打印原始手柄事件 (确认轴/按键编号时使用)")
+    p.add_argument(
         "--ramp", type=float, default=2.0,
         help="位置控制启动斜坡时长 (秒)"
     )
@@ -979,12 +1496,59 @@ def parse_args():
         help="模拟 RL 推理失败率 (0-1, 用于测试降级)"
     )
     p.add_argument(
+        "--imu-delay-ms", type=float, default=0.0,
+        help="观测路径的 IMU 延迟 (ms)；PD/plant 仍用当前状态"
+    )
+    p.add_argument(
+        "--joint-delay-ms", type=float, default=0.0,
+        help="观测路径的关节 q/dq 延迟 (ms)；PD/plant 仍用当前状态"
+    )
+    p.add_argument(
+        "--packet-loss", type=float, default=0.0,
+        help="每个 target tick 的关节反馈丢包概率 (0-1)"
+    )
+    p.add_argument(
+        "--loss-burst-ms", type=float, default=0.0,
+        help="丢包 burst 持续时间 (ms)；0 = 一个 target tick"
+    )
+    p.add_argument(
+        "--loss-target", choices=["joint", "bus", "all"], default="joint",
+        help="丢包作用对象: joint=单关节, bus=整条腿/总线, all=全部"
+    )
+    p.add_argument(
+        "--cmd-loss", type=float, default=0.0,
+        help="每个 target tick 的命令丢包概率 (保持上一目标)"
+    )
+    p.add_argument(
         "--policy", type=str, default="",
         help="ONNX 策略模型路径 (使用真实 RL 推理替代 mock 策略)"
     )
     p.add_argument(
         "--log-dir", type=str, default="logs",
         help="日志输出目录 (默认 logs/)"
+    )
+    p.add_argument(
+        "--lin-vel-mode", choices=["true", "zero", "command", "noisy"],
+        default="true",
+        help="观测中 base_lin_vel 的来源: true=仿真真值, zero=置零, "
+             "command=速度指令近似, noisy=真值+U(-0.5,0.5)"
+    )
+    p.add_argument(
+        "--joint-convention", choices=["firmware", "training"],
+        default="firmware",
+        help="模型关节符号约定: firmware=docs/URDF/xml, training=LainLab mjlab XML"
+    )
+    p.add_argument(
+        "--start-pose", choices=["rest", "default"], default="rest",
+        help="初始姿态: rest=趴伏 (Ready), default=站立默认位 (消融实验)"
+    )
+    p.add_argument(
+        "--base-height", type=float, default=0.158,
+        help="--start-pose default 时的 base 高度 (m)"
+    )
+    p.add_argument(
+        "--seed", type=int, default=0,
+        help="--lin-vel-mode noisy 的噪声随机种子"
     )
     return p.parse_args()
 
@@ -997,6 +1561,7 @@ def key_callback_wrapper(keyboard: KeyboardHandler):
 
 
 def main():
+    global JOINT_LOWER, JOINT_UPPER
     args = parse_args()
 
     if not HAS_MUJOCO:
@@ -1006,11 +1571,44 @@ def main():
     model_path = args.model if args.model else find_model_path()
     print(f"模型: {model_path}")
 
+    if args.joint_convention == "training":
+        JOINT_LOWER = TRAINING_JOINT_LOWER.copy()
+        JOINT_UPPER = TRAINING_JOINT_UPPER.copy()
+
     config = DeployConfig(
         pc_startup_ramp_s=args.ramp,
         pc_startup_max_deviation=args.max_deviation,
+        lin_vel_mode=args.lin_vel_mode,
+        imu_delay_ms=args.imu_delay_ms,
+        joint_delay_ms=args.joint_delay_ms,
+        packet_loss=args.packet_loss,
+        loss_burst_ms=args.loss_burst_ms,
+        loss_target=args.loss_target,
+        cmd_loss=args.cmd_loss,
     )
-    keyboard = KeyboardHandler()
+    keyboard = KeyboardHandler(quit_only=args.joystick is not None)
+    command_source = keyboard
+    joystick: Optional[JoystickHandler] = None
+    if args.joystick is not None:
+        try:
+            joystick = JoystickHandler(
+                None if args.joystick in ("", "auto") else args.joystick,
+                axis_vx=args.joy_axis_vx,
+                axis_vy=args.joy_axis_vy,
+                axis_yaw=args.joy_axis_yaw,
+                btn_a=args.joy_btn_a,
+                btn_b=args.joy_btn_b,
+                btn_x=args.joy_btn_x,
+                btn_y=args.joy_btn_y,
+                btn_back=args.joy_btn_back,
+                btn_start=args.joy_btn_start,
+                debug=args.joy_debug,
+            )
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            sys.exit(1)
+        command_source = joystick
+
     if args.policy:
         print(f"ONNX 策略: {args.policy}")
         mock_policy = OnnxPolicy(args.policy)
@@ -1020,21 +1618,31 @@ def main():
     if args.mode == "pc":
         keyboard.active_requested = True
         keyboard.position_control = True
+        if joystick is not None:
+            joystick.mapper.active_requested = True
+            joystick.mapper.position_control = True
     elif args.mode == "rl":
         keyboard.active_requested = True
         keyboard.rl_inference = True
+        if joystick is not None:
+            joystick.mapper.active_requested = True
+            joystick.mapper.rl_inference = True
 
     sim = OpenDogeSimulator(
         model_path, render=not args.no_render,
         key_callback=key_callback_wrapper(keyboard) if not args.no_render else None,
+        joint_convention=args.joint_convention,
     )
-    sim.reset_to_rest_pose()
+    if args.start_pose == "default":
+        sim.reset_to_default_pose(base_height=args.base_height)
+    else:
+        sim.reset_to_rest_pose()
 
     print(f"站立默认位 (DEFAULT_POS, 策略训练用): {dict(zip(JOINT_NAMES, DEFAULT_POS))}")
     print(f"趴伏初始位 (REST_POSE, Ready 态):       {dict(zip(JOINT_NAMES, REST_POSE))}")
     print()
     print(
-        f"配置: kp={config.kp}, kd={config.kd} (joint damping=0.5), safe_kd={config.safe_kd}, "
+        f"配置: kp={config.kp}, kd={config.kd}, safe_kd={config.safe_kd}, "
         f"action_scale={config.action_scale}"
     )
     print(f"斜坡: {config.pc_startup_ramp_s}s, 最大偏差: {config.pc_startup_max_deviation}rad")
@@ -1043,12 +1651,20 @@ def main():
     print(f"RL 失败率: {args.rl_failure_rate}")
     print()
     print("═" * 80)
-    print("键盘控制:")
-    print("  A / Space  → 位置控制    B → 停用")
-    print("  X          → RL 推理     Y → 位置控制")
-    print("  ↑ ↓        → 前进/后退   ← → → 左移/右移")
-    print("  0          → 停止移动")
-    print("  Backspace  → 急停        Esc / Q → 退出")
+    if joystick is not None:
+        print(f"手柄控制 ({joystick.device}):")
+        print("  左摇杆     → vx / vy     右摇杆 X → yaw_rate")
+        print("  A          → 激活 + 位置控制      B → 停用")
+        print("  X          → RL 推理              Y → 位置控制")
+        print("  START(LB)  → 切换使能             BACK(RB) → 切换 low_gain")
+        print("  Esc / Q    → 退出 (终端 Ctrl+C 同样有效)")
+    else:
+        print("键盘控制:")
+        print("  A / Space  → 位置控制    B → 停用")
+        print("  X          → RL 推理     Y → 位置控制")
+        print("  ↑ / ↓      → 前进/后退   ← / → → 左移/右移")
+        print("  0          → 停止移动")
+        print("  Backspace  → 急停        Esc / Q → 退出")
     print("═" * 80)
     print()
 
@@ -1072,10 +1688,12 @@ def main():
         print(f"日志: {log_path}")
 
     controller = DeployController(
-        sim=sim, config=config, keyboard=keyboard,
+        sim=sim, config=config, keyboard=command_source,
         mock_policy=mock_policy,
         static_vx=args.cmd[0], static_vy=args.cmd[1], static_yaw=args.cmd[2],
         logger=logger,
+        lin_vel_mode=args.lin_vel_mode,
+        seed=args.seed,
     )
 
     start_time = time.time()
@@ -1097,6 +1715,9 @@ def main():
                 pass
 
             if not paused:
+                # 手柄模式下键盘只负责 Esc/Q 退出
+                if joystick is not None:
+                    keyboard.process_keys()
                 if not controller.step():
                     break
                 step_count += 1
@@ -1117,6 +1738,8 @@ def main():
         print("\n用户中断 (Ctrl+C)")
     finally:
         sim_time = sim.data.time
+        if joystick is not None:
+            joystick.close()
         sim.close()
         if logger is not None:
             logger.close()

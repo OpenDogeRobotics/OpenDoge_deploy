@@ -74,7 +74,8 @@ public:
           error = "ONNX output contains NaN or Inf";
           return false;
         }
-        action[i] = std::clamp(value, -1.0, 1.0);
+        // Policy output is intentionally unbounded (training applies no clip).
+        action[i] = value;
       }
     } catch (const std::exception & exc) {
       error = exc.what();

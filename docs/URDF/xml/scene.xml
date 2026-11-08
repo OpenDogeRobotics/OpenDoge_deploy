@@ -20,3 +20,4 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" contype="1" conaffinity="1" />
   </worldbody>
 </mujoco>
+

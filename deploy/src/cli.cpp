@@ -26,11 +26,19 @@ void printUsage()
     << "  --enable                                set motion mode and enable motors on startup\n"
     << "  --clear-fault                           send stop(clear_fault=1) before enable\n"
     << "  --start-active                          enter active after readiness checks\n"
+    << "  --low-gain                              force low_gain_mode (joystick-proof)\n"
     << "  --allow-missing-imu                     permit active with default IMU sample\n"
     << "  --realtime                              try mlockall + SCHED_FIFO\n"
     << "  --rt-priority N                         SCHED_FIFO priority (default 60)\n"
     << "  --cpu N                                 pin process to CPU N\n"
-    << "  --duration-sec SEC                      stop after SEC, 0 means until Ctrl+C\n";
+    << "  --duration-sec SEC                      stop after SEC, 0 means until Ctrl+C\n"
+    << "  --lin-vel-source zero|command|imu        base_lin_vel source for the 48-dim obs\n"
+    << "  --kp K / --kd K                         override PD gains for bring-up\n"
+    << "  --dump-config                           print effective calibration and exit\n"
+    << "  --disable-on-exit                       send COMM_STOP to all motors on exit (default)\n"
+    << "  --keep-enabled                          leave motors enabled in damping on exit\n"
+    << "  --allow-latched-activation              accept active=true at startup (default: require a fresh A)\n"
+    << "  --skip-self-check                       skip the startup motor mode/fault self-check\n";
 }
 
 bool parseArgs(int argc, char ** argv, Options & opt)
@@ -70,6 +78,8 @@ bool parseArgs(int argc, char ** argv, Options & opt)
       } else if (arg == "--start-active") {
         opt.start_active = true;
         opt.static_command.active = true;
+      } else if (arg == "--low-gain") {
+        opt.low_gain = true;
       } else if (arg == "--allow-missing-imu") {
         opt.allow_missing_imu = true;
       } else if (arg == "--realtime") {
@@ -82,6 +92,22 @@ bool parseArgs(int argc, char ** argv, Options & opt)
         opt.status_file = need_value(arg);
       } else if (arg == "--duration-sec") {
         opt.duration_s = std::stod(need_value(arg));
+      } else if (arg == "--lin-vel-source") {
+        opt.lin_vel_source = need_value(arg);
+      } else if (arg == "--kp") {
+        opt.kp_override = std::stod(need_value(arg));
+      } else if (arg == "--kd") {
+        opt.kd_override = std::stod(need_value(arg));
+      } else if (arg == "--dump-config") {
+        opt.dump_config = true;
+      } else if (arg == "--disable-on-exit") {
+        opt.disable_on_exit = true;
+      } else if (arg == "--keep-enabled") {
+        opt.disable_on_exit = false;
+      } else if (arg == "--allow-latched-activation") {
+        opt.require_fresh_activation = false;
+      } else if (arg == "--skip-self-check") {
+        opt.skip_self_check = true;
       } else {
         throw std::runtime_error("unknown argument: " + arg);
       }

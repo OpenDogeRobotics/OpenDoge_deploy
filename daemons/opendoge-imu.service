@@ -5,6 +5,8 @@ After=default.target
 
 [Service]
 Type=simple
+# Keep file-IPC writers off the deploy's realtime core (CPU 0).
+CPUAffinity=6 7
 
 # 自动检测 DM-IMU-L1 (USB ID 6877:4d55) — 支持 ttyACM 和 ttyUSB
 # 等待最多 15s 直到设备出现
@@ -31,6 +33,7 @@ exec /usr/bin/python3 /home/orangepi/Opendoge/OpenDoge_firmware/hardware/imu/dm_
     --baud 921600 \
     --configure-usb \
     --output /tmp/opendoge_imu.state'
+    #--gyro-lowpass-hz 40' 低通使用IIR平均算出高频信号减小震荡，对低频信号无影响，需要再加
 
 Restart=always
 RestartSec=3

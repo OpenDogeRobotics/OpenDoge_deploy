@@ -15,3 +15,7 @@ __pycache__/
 *.mcap
 
 .DS_Store
+
+# 本地开发工具 / 运行时产物
+.vscode/
+MUJOCO_LOG.TXT

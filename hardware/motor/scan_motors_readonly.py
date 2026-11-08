@@ -120,6 +120,9 @@ def check_channel_state(channel: str) -> Optional[str]:
             return "DOWN"
         if "ERROR-PASSIVE" in output:
             return "ERROR-PASSIVE"
+        # vcan (USB2CAN 桥接) 没有真实 bitrate/错误状态，非 DOWN 即视为可用
+        if "vcan" in output:
+            return "OK"
         if "ERROR-ACTIVE" in output or "state UP" in output:
             return "OK"
     except Exception:
@@ -239,6 +242,15 @@ def read_param_uint32(sock: socket.socket, motor_id: int, index: int,
     return None
 
 
+def _read_param_retry(fn, *args, retries: int = 2, **kwargs):
+    """USB2CAN 串口路径会丢帧；参数读失败时重试。"""
+    for _ in range(max(1, retries)):
+        value = fn(*args, **kwargs)
+        if value is not None:
+            return value
+    return None
+
+
 def read_motor_status(sock: socket.socket, motor_id: int, timeout: float = 0.3) -> dict:
     """读取电机完整状态 (只读)"""
     result = {
@@ -249,10 +261,14 @@ def read_motor_status(sock: socket.socket, motor_id: int, timeout: float = 0.3) 
         "fault_sta": None,
     }
 
-    result["run_mode"] = read_param_float(sock, motor_id, IDX_RUN_MODE, timeout)
-    result["position"] = read_param_float(sock, motor_id, IDX_MECH_POS, timeout)
-    result["velocity"] = read_param_float(sock, motor_id, IDX_MECH_VEL, timeout)
-    result["fault_sta"] = read_param_uint32(sock, motor_id, IDX_FAULT_STA, timeout)
+    result["run_mode"] = _read_param_retry(
+        read_param_float, sock, motor_id, IDX_RUN_MODE, timeout)
+    result["position"] = _read_param_retry(
+        read_param_float, sock, motor_id, IDX_MECH_POS, timeout)
+    result["velocity"] = _read_param_retry(
+        read_param_float, sock, motor_id, IDX_MECH_VEL, timeout)
+    result["fault_sta"] = _read_param_retry(
+        read_param_uint32, sock, motor_id, IDX_FAULT_STA, timeout)
 
     return result
 
@@ -343,6 +359,8 @@ def main() -> int:
                         help="自定义电机 ID 列表, 逗号分隔")
     parser.add_argument("--timeout", type=float, default=0.3,
                         help="单个参数读取超时 (秒, 默认 0.3)")
+    parser.add_argument("--discovery-passes", type=int, default=3,
+                        help="逐 ID 补扫轮数 (默认 3；丢帧时多轮补扫)")
     parser.add_argument("--listen", type=float, default=0,
                         help="扫描后额外被动监听 N 秒")
     parser.add_argument("--skip-bad", action="store_true", default=True,
@@ -385,12 +403,23 @@ def main() -> int:
             print(f"\n[{channel}] {leg} ({state}) — 广播发现...")
             discovered = discover_motors(sock, timeout=1.5)
 
-            # 第二步: 如果没有广播响应, 逐 ID 查询
-            if not discovered:
-                print(f"  广播无响应, 逐 ID 扫描 {min(target_ids)}-{max(target_ids)}...")
-                for mid in target_ids:
+            # 第二步: 对广播未发现的 ID 逐个补扫，并重复多轮。
+            # 多个电机同时应答时，USB2CAN 串口路径会丢帧，不能因为某一轮
+            # 没回复就认为电机不在线；只对仍然缺失的 ID 继续补扫。
+            for attempt in range(max(1, args.discovery_passes)):
+                missing = [mid for mid in target_ids if mid not in discovered]
+                if not missing:
+                    break
+                if attempt == 0:
+                    if not discovered:
+                        print(f"  广播无响应, 逐 ID 扫描 {min(target_ids)}-{max(target_ids)}...")
+                    else:
+                        print(f"  广播只发现 {sorted(discovered)}, 补扫其余 ID ...")
+                else:
+                    print(f"  第 {attempt + 1} 轮补扫: {sorted(missing)} ...")
+                for mid in missing:
                     send(sock, COMM_GET_DEVICE_ID, mid, [0] * 8)
-                    frame = recv(sock, 0.05)
+                    frame = recv(sock, 0.1)
                     if frame:
                         can_id, _ = frame
                         comm_type, data2, _ = parse_ext_id(can_id)

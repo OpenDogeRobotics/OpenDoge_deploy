@@ -1,29 +1,24 @@
 [Unit]
-Description=OpenDoge Xbox Controller Driver (xboxdrv)
+Description=OpenDoge Gamepad Driver / Readiness (xboxdrv or native js0)
 Documentation=https://github.com/Lain-Ego/OpenDoge_firmware
 After=multi-user.target
 Wants=multi-user.target
+# No limit on restart count (clone dongles can be flaky).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Wait up to 30s for the 2.4G dongle to appear on USB
-ExecStartPre=/bin/sh -c 'for i in $$(seq 1 30); do lsusb | grep -q "413d:2104" && exit 0; sleep 1; done; echo "dongle not found after 30s" >&2; exit 1'
-# Run in foreground so systemd tracks the PID directly (no --silent/--daemon).
-# Logs go to journal; use --dbus disabled to avoid spurious warnings.
-Environment=XBOX_USB_ID=413d:2104
-ExecStart=/usr/bin/xboxdrv \
-    --device-by-id ${XBOX_USB_ID} \
-    --type xbox360 \
-    --detach-kernel-driver \
-    --dbus disabled
-# Always restart on exit — handles clone-dongle ENODEV crashes.
+# start_gamepad.sh supports:
+#   413d:2104 Xbox dongle -> xboxdrv creates /dev/input/js0
+#   3537:1041 Zikway      -> kernel hid-generic/joydev creates js0 (no xboxdrv)
+# __REPO_ROOT__ is substituted by scripts/install_services.sh.
+ExecStart=/bin/sh __REPO_ROOT__/scripts/start_gamepad.sh
+# Always restart on exit — handles dongle ENODEV / receiver mode switches.
 Restart=always
 RestartSec=5
-# No limit on restart count (clone dongles can be flaky).
-StartLimitIntervalSec=0
-TimeoutStartSec=30
+TimeoutStartSec=45
 # Cleanup: kill any stale xboxdrv before starting.
-ExecStopPost=-/usr/bin/killall xboxdrv 2>/dev/null || true
+ExecStopPost=-/bin/sh -c 'killall xboxdrv 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

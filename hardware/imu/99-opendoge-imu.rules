@@ -1,0 +1,3 @@
+# OpenDoge DM-IMU-L1 (USB 6877:4d55) -> /dev/ttyACM*
+# opendoge-imu 是 user service，需要能直接打开该串口。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="6877", ATTRS{idProduct}=="4d55", MODE:="0666"

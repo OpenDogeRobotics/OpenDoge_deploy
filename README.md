@@ -22,8 +22,8 @@ OpenDoge_firmware/
   sim2sim/                         # sim2sim 管线验证仿真
   docs/                            # EL05 手册、原理图、vendor 参考
   scripts/
-    setup_can.sh                   # USB2CAN SocketCAN 启动脚本
-    setup_vcan.sh                  # 虚拟 CAN 无硬件测试
+    setup_can.sh                   # USB-CAN (CHIWU) 原生 SocketCAN 配置
+    setup_vcan.sh                  # 虚拟 CAN 无硬件测试（手动，仅离线）
     setup_onnx.sh                  # ONNX Runtime 下载安装
     start_robot.sh                 # 整机启动聚合脚本
     install_services.sh            # 一键安装 systemd 服务
@@ -97,7 +97,7 @@ gyro(3) + neg_gravity(3) + dof_pos_delta(12) + dof_vel(12)
 | dof_pos_delta | 6:18 | 关节位置 − default_angles |
 | dof_vel | 18:30 | 关节速度 (rad/s) |
 | last_action | 30:42 | 上一帧策略输出 |
-| commands | 42:45 | vx, vy, vyaw (原始值) |
+| commands | 42:45 | vx, vy, v (原始值) |
 | feet_phase | 45:49 | 自适应步态相位 (FL, FR, RL, RR) |
 
 > **关键设计**：linvel（局部线速度）从 actor 观测中移除。训练采用非对称 actor-critic — critic 保留 privileged linvel 做值估计，actor 只依赖实机可获取的 49 维观测。这消除了 sim2real 的根本性 gap。
@@ -344,7 +344,10 @@ IMU bridge：
   --output /tmp/opendoge_imu.state
 ```
 
-## vcan 无硬件 CAN 测试
+## vcan 无硬件 CAN 测试（仅离线）
+
+> ⚠️ 生产硬件是 CHIWU 原生 can0-can3；vcan 与原生接口同名，测试前先
+> `sudo systemctl stop opendoge-can` 并拔掉 USB-CAN 板，测完删除 vcan 再恢复。
 
 EL05 协议打包自检：
 

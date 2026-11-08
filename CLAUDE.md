@@ -107,11 +107,20 @@ Orange Pi 5 → USB 2.0 Hub (带外部供电) → 4× CANable (gs_usb, candleLig
 | CAN 接口数 | 4 (can0-can3) |
 | 供电 | **USB Hub 必须带外部供电** (Orange Pi 5 供电不足) |
 
+> **当前实际适配器**: 赤乌（CHIWU）4×CAN + 3×RS485 控制板，单 USB-A，
+> 原生 SocketCAN `can0-can3`，见 `docs/usb2can/chiwu_usb2can.md`。
+> 不创建 vcan、不需要 userspace bridge；EL05 仍使用经典 CAN 1 Mbps，不要开 FD。
+>
+> 旧的 DINGLAB/SOULDE USB2CAN V2.0（`1483:1110`, CDC-ACM + vcan 桥接）
+> 已归档到 `~/DingLab usb转can代码`，见 `docs/legacy/README.md`。
+> 达妙 DM-USB2CANFD Dual（`gs_usb` 固件）保留为备选，当前不使用。
+
 CAN 接口由 `opendoge-can.service` (system oneshot) 在开机时自动配置。手动管理：
 ```bash
 sudo systemctl status opendoge-can              # 查看状态
 sudo systemctl restart opendoge-can             # 重新配置 4 个 CAN 口
 sudo journalctl -u opendoge-can -n 20           # 查看最近日志
+sudo scripts/reset_can_usb.sh                   # 电机断电导致 CHIWU 板复位后 (err=-110)
 ```
 
 底层手动命令 (通常不需要，用 systemd 即可)：
@@ -149,17 +158,17 @@ python3 hardware/motor/scan_motors_readonly.py
 | 数组索引 | 关节名 | CAN 总线 | 电机 ID | 腿上位置 | 默认站立角 | 轴 |
 |---------|--------|---------|--------|---------|-----------|-----|
 | 0 | `FL_hip_joint` | can0 | 1 | FL Hip (髋) | 0.0 | X (roll) |
-| 1 | `FL_thigh_joint` | can0 | 2 | FL Thigh (大腿) | 0.5 | Y (pitch) |
-| 2 | `FL_calf_joint` | can0 | 3 | FL Calf (小腿) | -1.3 | Y (pitch) |
+| 1 | `FL_thigh_joint` | can0 | 2 | FL Thigh (大腿) | 0.8 | Y (pitch) |
+| 2 | `FL_calf_joint` | can0 | 3 | FL Calf (小腿) | -1.6 | Y (pitch) |
 | 3 | `FR_hip_joint` | can1 | 4 | FR Hip (髋) | 0.0 | X (roll) |
-| 4 | `FR_thigh_joint` | can1 | 5 | FR Thigh (大腿) | 0.5 | Y (pitch) |
-| 5 | `FR_calf_joint` | can1 | 6 | FR Calf (小腿) | -1.3 | Y (pitch) |
+| 4 | `FR_thigh_joint` | can1 | 5 | FR Thigh (大腿) | 0.8 | Y (pitch) |
+| 5 | `FR_calf_joint` | can1 | 6 | FR Calf (小腿) | -1.6 | Y (pitch) |
 | 6 | `RL_hip_joint` | can2 | 7 | RL Hip (髋) | 0.0 | X (roll) |
-| 7 | `RL_thigh_joint` | can2 | 8 | RL Thigh (大腿) | 0.7 | Y (pitch) |
-| 8 | `RL_calf_joint` | can2 | 9 | RL Calf (小腿) | -1.3 | Y (pitch) |
+| 7 | `RL_thigh_joint` | can2 | 8 | RL Thigh (大腿) | 0.8 | Y (pitch) |
+| 8 | `RL_calf_joint` | can2 | 9 | RL Calf (小腿) | -1.6 | Y (pitch) |
 | 9 | `RR_hip_joint` | can3 | 10 | RR Hip (髋) | 0.0 | X (roll) |
-| 10 | `RR_thigh_joint` | can3 | 11 | RR Thigh (大腿) | 0.7 | Y (pitch) |
-| 11 | `RR_calf_joint` | can3 | 12 | RR Calf (小腿) | -1.3 | Y (pitch) |
+| 10 | `RR_thigh_joint` | can3 | 11 | RR Thigh (大腿) | 0.8 | Y (pitch) |
+| 11 | `RR_calf_joint` | can3 | 12 | RR Calf (小腿) | -1.6 | Y (pitch) |
 
 **物理接线对应：**
 - CAN 口 0 → 左前腿 (FL) → 电机 1/2/3
@@ -178,19 +187,23 @@ ONNX output[i] → action[i] → target[i] → motor_id = i+1
 
 **设置电机 ID 时需要将出厂默认 127 逐个改为表中 Motor ID。** 每条 CAN 总线上的 3 个电机按物理位置 (hip→thigh→calf) 分别设为 1-3/4-6/7-9/10-12。
 
-### 6. 默认站立姿态 (必须匹配训练 keyframe)
+### 6. 默认站立姿态 (必须匹配训练 default_joint_pos)
 
 ```
-前腿: hip=0, thigh=0.5, calf=-1.3
-后腿: hip=0, thigh=0.7, calf=-1.3
+全部四条腿 (固件 URDF 约定): hip=0, thigh=0.8, calf=-1.6
 ```
 
-### 7. 观测格式 (49 维，无 privileged info)
+### 7. 观测格式 (48 维，LainLab mjlab，无 privileged info)
 
 ```
-gyro(3) + neg_gravity(3) + dof_pos_diff(12) + dof_vel(12)
-+ last_action(12) + commands(3) + feet_phase(4)
+base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
++ joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)
 ```
+
+关节量与动作需经 `kJointSign = {+1,+1,+1, +1,-1,-1, -1,+1,+1, -1,-1,-1}`
+在固件 URDF 约定与训练约定之间映射。`last_action` 为原始策略输出（不裁剪）。
+`base_lin_vel` 在真机上由 `lin_vel_source=zero|command|imu` 决定。
+详见 `sim2sim/CLAUDE.md` Round 4。
 
 ## systemd 服务架构
 
@@ -213,7 +226,13 @@ opendoge-xboxdrv → /dev/input/js0 → opendoge-joystick → /tmp/opendoge_comm
 opendoge-imu (auto-detect /dev/ttyUSBx by USB ID 6877:4d55) → /tmp/opendoge_imu.state
 ```
 
-C++ deploy 通过 `runtime_io.cpp` 的 `readImuFile()` / `readCommandFile()` 以 200 Hz 轮询这些文件。这是有意设计：
+> 当前硬件是赤乌（CHIWU）4×CAN 原生 SocketCAN：`opendoge-can.service`
+> 直接配置 `can0-can3`。旧的 DINGLAB vcan + bridge 方案已归档到
+> `~/DingLab usb转can代码`（见 `docs/legacy/README.md`），不再安装/运行。
+
+C++ deploy 通过 `runtime_io.cpp` 的 `readImuFile()` / `readCommandFile()` 轮询这些文件。
+安全/命令轮询仍是 200 Hz；**策略观测在推理 tick（100 Hz）前会重新 `can.drain` 并
+重读 IMU 文件**，避免观测等待 200 Hz 轮询相位（修改 64）。这是有意设计：
 - 实时循环 (`SCHED_FIFO`) 免于处理串口/HID I/O
 - 守护进程可独立重启
 - dry-run 测试可直接写入文件注入假数据
@@ -248,13 +267,13 @@ lsusb | grep 6877:4d55                              # 确认 IMU 已连接
 
 | 属性 | 值 |
 |------|-----|
-| 硬件 | 2.4G XBOX 360 For Windows (克隆 dongle) |
-| USB ID | `413d:2104` |
-| 驱动 | xboxdrv (用户态, 需剥离内核 hid-generic) |
-| 设备节点 | `/dev/input/js0` → `Xbox Gamepad (userspace driver)` |
+| 硬件 | 2.4G Xbox 兼容接收器（`413d:2104` 或 Zikway `3537:1041`） |
+| USB ID | `413d:2104`（xboxdrv）/ `3537:1041`（内核原生 js0） |
+| 驱动 | `413d:2104` → xboxdrv；`3537:1041` → 内核 `hid-generic`/`joydev` |
+| 设备节点 | `/dev/input/js0`（名称取决于驱动） |
 | 桥接脚本 | `hardware/gamepad/xbox_command_bridge.py` |
 | 输出文件 | `/tmp/opendoge_command.state` |
-| 当前状态 | ✅ 正常运行 |
+| 当前状态 | ⚠️ 接收器为 `3537:1041`，原生 js0；`opendoge-xboxdrv` 已改为包装脚本，按钮映射待 `jstest` 确认 |
 
 **轴/按键映射** (xboxdrv 默认, 已验证):
 
@@ -264,17 +283,25 @@ lsusb | grep 6877:4d55                              # 确认 IMU 已连接
 | 左摇杆 X | axis0 | vy (侧向速度) |
 | 右摇杆 X | axis2 | yaw_rate (转向角速度) |
 | A | btn0 | 激活 + 位置控制模式 |
-| B | btn1 | 失能 |
+| B | btn1 | 退出位置控制/RL，回到阻尼（不是电机失能） |
 | X | btn2 | 进入 RL 推理 |
 | Y | btn3 | 退出 RL 推理 |
 | BACK | btn6 | 切换 low_gain_mode |
 | START | btn7 | 切换使能 |
-| RB | btn5 | 死手开关 (`--require-rb`) |
+| RB | btn5 | 可配置为急停 (`--btn-estop`)；当前实机 Zikway 用 btn11 |
+
+> Zikway `3537:1041` 原生 js0 的按钮编号：A=0、B=1、X=btn3、Y=btn4、
+> START=btn6(LB)、BACK=btn7(RB)、**急停=btn11**（Home 右边、三个横杠平行排列的键）。
+> 急停是**锁存**：按一次置 `estop=true`、active=false、速度归零；再按 **A**
+> 清除 estop 并发送 `clear_fault` 恢复。**不需要一直按住**。
+> 与 sim2sim `--joystick` 默认值一致（sim 不含急停键）；
+> `xbox_command_bridge.py --profile auto` 会自动套用，仍建议用
+> `jstest /dev/input/js0` 确认。
 
 **systemd 服务** (开机自启):
 
 ```
-opendoge-xboxdrv.service   (system) → xboxdrv, Type=simple, Restart=always
+opendoge-xboxdrv.service   (system) → start_gamepad.sh (xboxdrv or native js0), Type=simple, Restart=always
 opendoge-joystick.service  (user)   → bridge, Type=simple, Restart=always
 opendoge-imu.service       (user)   → DM-IMU-L1 bridge, Type=simple, Restart=always
 opendoge-can.service       (system) → CAN interface setup, Type=oneshot
@@ -362,7 +389,7 @@ sudo ./scripts/setup_vcan.sh can0 can1 can2 can3
 |----------|-----|------------|----------|
 | FL/RL Hip | X (1,0,0) | 外展 (远离中线) | 向外推 |
 | FR/RR Hip | X (1,0,0) | 内收 (靠近中线) | **向内推** |
-| 全部 Thigh | Y (0,1,0) | 屈髋 (膝向前) | 向前推 |
+| 全部 Thigh | Y (0,1,0) | 伸髋 (膝盖向尾部) | **向后推 (膝盖朝尾部)** |
 | 全部 Calf | Y (0,1,0) | 伸膝 (脚远离) | 伸直小腿 |
 
 ⚠️ FR/RR hip 与 FL/RL hip 的 URDF 正方向物理含义相反 (都绕 +X 轴, 右手定则下左右侧对称)。
@@ -372,13 +399,19 @@ sudo ./scripts/setup_vcan.sh can0 can1 can2 can3
 | 关节 | dir | 关节 | dir |
 |------|-----|------|-----|
 | FL_hip | **-1** | FR_hip | **-1** |
-| FL_thigh | +1 | FR_thigh | **-1** |
+| FL_thigh | **-1** | FR_thigh | **+1** |
 | FL_calf | +1 | FR_calf | **-1** |
 | RL_hip | +1 | RR_hip | +1 |
-| RL_thigh | +1 | RR_thigh | **-1** |
+| RL_thigh | **-1** | RR_thigh | **+1** |
 | RL_calf | +1 | RR_calf | **-1** |
 
-规律: Thigh/Calf 左右镜像 (L=+1, R=-1), Hip 前后分 (F=-1, R=+1)。
+规律: Calf 左右镜像 (L=+1, R=-1); Thigh 因 URDF 正方向朝尾部，映射为
+L=-1, R=+1（与 Calf 相反）; Hip 前后分 (F=-1, R=+1)。
+
+> ⚠️ 2026-11-06 修正（修改 54）：Thigh 的 URDF 正方向是“膝盖向尾部”，
+> 旧表写的“屈髋（膝向前）”是错的，导致四条大腿的 direction 反了。
+> `discover_direction.py` 的 thigh 提示已改为“向后推（膝盖往尾部方向）”，
+> 上表已按修正后的约定更新。髋和小腿不受影响。
 
 ### 电机零位标定方案 (2026-06-26)
 

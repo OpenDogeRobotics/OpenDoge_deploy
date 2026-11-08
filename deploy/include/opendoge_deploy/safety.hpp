@@ -19,6 +19,7 @@ bool safetyFault(
   const ImuSample & imu,
   std::array<JointSafetyState, kNumJoints> & safety_state,
   double now_s,
+  double standup_start_s,
   std::string & reason);
 
 }  // namespace opendoge

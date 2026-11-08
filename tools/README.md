@@ -11,7 +11,7 @@
 | Scan motors (read-only) | `hardware/motor/scan_motors_readonly.py` |
 | DM-IMU-L1 bridge | `hardware/imu/` |
 | Xbox gamepad bridge | `hardware/gamepad/` |
-| USB2CAN reference | `docs/usb2can/` |
+| USB-CAN (CHIWU) reference | `docs/usb2can/` |
 | Deploy runtime (C++) | `deploy/` |
 | sim2sim verification | `sim2sim/` |
 | Web console | `web_tools/` |

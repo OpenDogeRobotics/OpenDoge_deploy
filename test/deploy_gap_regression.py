@@ -11,33 +11,46 @@ Exit code: 0 = all tests passed, 1 = failures detected
 """
 
 import math
+import os
 import sys
 
 import numpy as np
 
-NUM_JOINTS = 12
-OBS_DIM = 49
+# Allow `from deploy_mujoco import ...` when run from the repo root.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sim2sim"))
 
-# Default standing pose (matches UniLab scene_flat.xml keyframe)
+NUM_JOINTS = 12
+OBS_DIM = 48
+
+# Default standing pose in firmware URDF convention
+# (matches LainLab JointPositionActionCfg default_joint_pos after sign mapping)
 DEFAULT_POS = np.array([
-    0.0, 0.5, -1.3,
-    0.0, 0.5, -1.3,
-    0.0, 0.7, -1.3,
-    0.0, 0.7, -1.3,
+    0.0, 0.8, -1.6,
+    0.0, 0.8, -1.6,
+    0.0, 0.8, -1.6,
+    0.0, 0.8, -1.6,
 ])
 
+# firmware URDF convention → training (LainLab) convention
+JOINT_SIGN = np.array([
+    +1, +1, +1,
+    +1, -1, -1,
+    -1, +1, +1,
+    -1, -1, -1,
+], dtype=float)
+
 JOINT_LOWER = np.array([
-    -0.785, -0.785, -2.68,
-    -0.26,  -0.785, -2.68,
-    -0.785, -0.785, -2.68,
-    -0.26,  -0.785, -2.68,
+    -1.0000, -1.0468, -2.68,
+    -0.5218, -1.0468, -2.68,
+    -0.9000, -0.8500, -2.68,
+    -0.5218, -0.8500, -2.68,
 ])
 
 JOINT_UPPER = np.array([
-    0.26,  1.134, -1.04,
-    0.785, 1.134, -1.04,
-    0.26,  1.134, -1.04,
-    0.785, 1.134, -1.04,
+    0.5218, 1.3958, -1.04,
+    1.0000, 1.3958, -1.04,
+    0.5218, 1.3958, -1.04,
+    0.9300, 1.3958, -1.04,
 ])
 
 MAX_POSITION_STEP = 0.015  # rad/target_tick
@@ -110,46 +123,43 @@ def test_advance_phase():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_observation(
-    joint_positions: np.ndarray,
-    joint_velocities: np.ndarray,
-    last_action: np.ndarray,
+    joint_positions: np.ndarray,   # firmware convention
+    joint_velocities: np.ndarray,  # firmware convention
+    last_action: np.ndarray,       # raw policy output, training convention
     vx: float, vy: float, yaw: float,
-    gyro: np.ndarray,
+    lin_vel: np.ndarray,
+    ang_vel: np.ndarray,
     gravity: np.ndarray,
-    phase: float,
 ) -> np.ndarray:
     obs = np.zeros(OBS_DIM)
     offset = 0
 
-    # 1. gyro (3) — no scaling
-    obs[offset:offset + 3] = gyro
+    # 1. base_lin_vel (3) — not measured by the stock IMU
+    obs[offset:offset + 3] = lin_vel
     offset += 3
 
-    # 2. projected_gravity (3) — no scaling
+    # 2. base_ang_vel (3) — no scaling
+    obs[offset:offset + 3] = ang_vel
+    offset += 3
+
+    # 3. projected_gravity (3) — no scaling
     obs[offset:offset + 3] = gravity
     offset += 3
 
-    # 3. dof_pos - default_pos (12)
-    obs[offset:offset + NUM_JOINTS] = joint_positions - DEFAULT_POS
+    # 4. joint_pos_rel (12) — training convention
+    obs[offset:offset + NUM_JOINTS] = JOINT_SIGN * (joint_positions - DEFAULT_POS)
     offset += NUM_JOINTS
 
-    # 4. dof_vel (12) — RAW, no *0.5 factor
-    obs[offset:offset + NUM_JOINTS] = joint_velocities
+    # 5. joint_vel_rel (12) — training convention, RAW (no *0.5)
+    obs[offset:offset + NUM_JOINTS] = JOINT_SIGN * joint_velocities
     offset += NUM_JOINTS
 
-    # 5. last_action (12)
+    # 6. last_action (12) — raw, no clamp, no sign flip
     obs[offset:offset + NUM_JOINTS] = last_action
     offset += NUM_JOINTS
 
-    # 6. commands (3)
+    # 7. commands (3)
     obs[offset:offset + 3] = [vx, vy, yaw]
-    offset += 3
-
-    # 7. feet_phase (4) — FL=phase, FR=(phase+0.5)%1, RL=(phase+0.5)%1, RR=phase
-    obs[offset + 0] = phase
-    obs[offset + 1] = math.fmod(phase + 0.5, 1.0)
-    obs[offset + 2] = math.fmod(phase + 0.5, 1.0)
-    obs[offset + 3] = phase
 
     return obs
 
@@ -158,44 +168,42 @@ def test_build_observation():
     q = DEFAULT_POS.copy()
     dq = np.full(NUM_JOINTS, 1.5)  # 1.5 rad/s on all joints
     last_action = np.zeros(NUM_JOINTS)
-    gyro = np.array([0.1, -0.2, 0.3])
+    lin_vel = np.array([0.4, -0.1, 0.02])
+    ang_vel = np.array([0.1, -0.2, 0.3])
     gravity = np.array([0.0, 0.0, -1.0])
 
-    obs = build_observation(q, dq, last_action, 0.5, 0.0, 0.0, gyro, gravity, 0.25)
+    obs = build_observation(q, dq, last_action, 0.5, 0.0, 0.0, lin_vel, ang_vel, gravity)
 
     check("obs dimension", len(obs) == OBS_DIM)
 
-    # CRITICAL: velocity must be raw 1.5, NOT 0.75
-    check("velocity raw (not *0.5)", np.allclose(obs[18:30], dq))
-    check("velocity value check", np.allclose(obs[18:30], np.full(NUM_JOINTS, 1.5)))
+    # CRITICAL: velocity must be raw 1.5 (sign-mapped), NOT 0.75
+    check("velocity raw (not *0.5)", np.allclose(obs[21:33], JOINT_SIGN * dq))
+    check("velocity value check", np.allclose(obs[21:33], JOINT_SIGN * 1.5))
 
-    # dof_pos_diff must be zero when at DEFAULT_POS
-    check("dof_pos_diff zero at default", np.allclose(obs[6:18], np.zeros(NUM_JOINTS)))
+    # joint_pos_rel must be zero when at DEFAULT_POS
+    check("joint_pos_rel zero at default", np.allclose(obs[9:21], np.zeros(NUM_JOINTS)))
 
-    # gyro placement
-    check("gyro", np.allclose(obs[0:3], gyro))
+    # lin_vel placement (first 3 dims of the LainLab actor observation)
+    check("lin_vel", np.allclose(obs[0:3], lin_vel))
+
+    # ang_vel placement
+    check("ang_vel", np.allclose(obs[3:6], ang_vel))
 
     # gravity placement
-    check("gravity", np.allclose(obs[3:6], gravity))
+    check("gravity", np.allclose(obs[6:9], gravity))
 
     # commands placement
-    check("commands", np.allclose(obs[42:45], [0.5, 0.0, 0.0]))
+    check("commands", np.allclose(obs[45:48], [0.5, 0.0, 0.0]))
 
-    # feet_phase
-    check("feet_phase FL=phase", obs[45] == 0.25)
-    check("feet_phase FR", abs(obs[46] - 0.75) < 1e-12)
-    check("feet_phase RL", abs(obs[47] - 0.75) < 1e-12)
-    check("feet_phase RR=phase", obs[48] == 0.25)
-
-    # Test with non-default position
+    # Test with non-default position (positive offset maps through JOINT_SIGN)
     q2 = DEFAULT_POS + np.array([0.1] * NUM_JOINTS)
-    obs2 = build_observation(q2, dq, last_action, 0.0, -0.3, 0.0, gyro, gravity, 0.5)
-    check("dof_pos_diff non-default", np.allclose(obs2[6:18], np.full(NUM_JOINTS, 0.1)))
+    obs2 = build_observation(q2, dq, last_action, 0.0, -0.3, 0.0, lin_vel, ang_vel, gravity)
+    check("joint_pos_rel non-default", np.allclose(obs2[9:21], JOINT_SIGN * 0.1))
 
-    # Test with non-zero last_action
-    la = np.full(NUM_JOINTS, 0.3)
-    obs3 = build_observation(q, dq, la, 0.0, 0.0, 0.0, gyro, gravity, 0.0)
-    check("last_action passthrough", np.allclose(obs3[30:42], la))
+    # Test with non-zero last_action — passed through unmodified (no clamp)
+    la = np.linspace(-3.8, 3.3, NUM_JOINTS)
+    obs3 = build_observation(q, dq, la, 0.0, 0.0, 0.0, lin_vel, ang_vel, gravity)
+    check("last_action passthrough (no clamp)", np.allclose(obs3[33:45], la))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -206,14 +214,14 @@ def test_build_observation():
 def test_target_computation():
     action_scale = 0.25
 
-    # RL mode: skip rate_limit, target = default_pos + action * action_scale
+    # RL mode: skip rate_limit, target = default_pos + sign * action * scale
     action = np.full(NUM_JOINTS, 1.0)
-    last_action = np.clip(action, -1.0, 1.0)
-    logical = DEFAULT_POS + last_action * action_scale
+    last_action = action  # no clamp (Gap 2)
+    logical = DEFAULT_POS + JOINT_SIGN * last_action * action_scale
     limited = logical.copy()  # RL mode: no rate_limit
 
     check("target rl action_scale 0.25", np.allclose(
-        limited - DEFAULT_POS, np.full(NUM_JOINTS, 0.25)))
+        limited - DEFAULT_POS, JOINT_SIGN * 0.25))
     check("target rl limited==logical", np.array_equal(limited, logical))
 
     # PC mode: rate_limit applies — each joint moves at most 0.015 rad/tick
@@ -225,11 +233,14 @@ def test_target_computation():
     check("target pc rate_limited", np.all(np.abs(limited_pc) <= 0.015 + 1e-12)
           and np.any(np.abs(limited_pc) > 0.0))
 
-    # Action clamping to [-1, 1]
+    # Action must NOT be clamped: mjlab applies raw * scale with no clipping
     large_action = np.array([-3.8, 3.3] + [0.0] * (NUM_JOINTS - 2))
-    clamped = np.clip(large_action, -1.0, 1.0)
-    check("action clamp upper", clamped[1] == 1.0)
-    check("action clamp lower", clamped[0] == -1.0)
+    last_action_large = large_action.copy()
+    check("action unclamped upper", last_action_large[1] == 3.3)
+    check("action unclamped lower", last_action_large[0] == -3.8)
+    check("large action target offset", np.isclose(
+        (DEFAULT_POS + JOINT_SIGN * last_action_large * action_scale)[0],
+        DEFAULT_POS[0] + JOINT_SIGN[0] * -3.8 * action_scale))
 
     # Joint limit clamping
     tgt_above = DEFAULT_POS + np.full(NUM_JOINTS, 100.0) * action_scale
@@ -241,14 +252,29 @@ def test_target_computation():
     tgt_low_gain = DEFAULT_POS.copy()  # action ignored
     check("lowgain target=default", np.allclose(tgt_low_gain, DEFAULT_POS))
 
+    # Stand-up handover blend: at alpha=0 the applied target is the default
+    # pose; at alpha=1 it is the full policy target; the applied target is
+    # rate-limited during the one-shot window.
+    policy_tgt = DEFAULT_POS + np.full(NUM_JOINTS, 0.9)
+    blend0 = DEFAULT_POS + 0.0 * (policy_tgt - DEFAULT_POS)
+    check("handover alpha0=default", np.allclose(blend0, DEFAULT_POS))
+    blend1 = DEFAULT_POS + 1.0 * (policy_tgt - DEFAULT_POS)
+    check("handover alpha1=policy", np.allclose(blend1, policy_tgt))
+    blend_mid = DEFAULT_POS + 0.5 * (policy_tgt - DEFAULT_POS)
+    check("handover mid", np.allclose(blend_mid, DEFAULT_POS + 0.45))
+    limited_mid = rate_limit(blend_mid[0], DEFAULT_POS[0], MAX_POSITION_STEP)
+    check("handover rate-limit",
+          abs(limited_mid - DEFAULT_POS[0]) <= MAX_POSITION_STEP + 1e-12)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. PD control — must match C++ controller.cpp computeMotorCommands()
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_pd_control():
-    kp = 20.0
-    kd = 0.3
+    # LainLab BuiltinPositionActuatorCfg(stiffness=12.0, damping=0.5)
+    kp = 12.0
+    kd = 0.5
     safe_kd = 2.0
 
     # Damping: kp=0, kd=safe_kd
@@ -260,15 +286,15 @@ def test_pd_control():
     # Active: kp=kp, kd=kd
     kp_active = np.full(NUM_JOINTS, kp)
     kd_active = np.full(NUM_JOINTS, kd)
-    check("active kp", np.all(kp_active == 20.0))
-    check("active kd", np.all(kd_active == 0.3))
+    check("active kp", np.all(kp_active == 12.0))
+    check("active kd", np.all(kd_active == 0.5))
 
-    # Ramping (50% through): kp=10, kd=(2.0 + 0.5*(0.3-2.0)) = 1.15
+    # Ramping (50% through): kp=6, kd=(2.0 + 0.5*(0.5-2.0)) = 1.25
     ramp_frac = 0.5
     kp_ramp = np.full(NUM_JOINTS, ramp_frac * kp)
     kd_ramp = np.full(NUM_JOINTS, safe_kd + ramp_frac * (kd - safe_kd))
-    check("ramp 50% kp", np.allclose(kp_ramp, np.full(NUM_JOINTS, 10.0)))
-    check("ramp 50% kd", np.allclose(kd_ramp, np.full(NUM_JOINTS, 1.15)))
+    check("ramp 50% kp", np.allclose(kp_ramp, np.full(NUM_JOINTS, 6.0)))
+    check("ramp 50% kd", np.allclose(kd_ramp, np.full(NUM_JOINTS, 1.25)))
 
     # Ramping (0%): kp=0, kd=safe_kd
     ramp_frac_0 = 0.0
@@ -287,8 +313,8 @@ def test_pd_control():
     # LowGainTest: kp*0.3, kd*0.3
     kp_lg = np.full(NUM_JOINTS, kp * 0.3)
     kd_lg = np.full(NUM_JOINTS, kd * 0.3)
-    check("lowgain kp 30%", np.allclose(kp_lg, np.full(NUM_JOINTS, 6.0)))
-    check("lowgain kd 30%", np.allclose(kd_lg, np.full(NUM_JOINTS, 0.09)))
+    check("lowgain kp 30%", np.allclose(kp_lg, np.full(NUM_JOINTS, 3.6)))
+    check("lowgain kd 30%", np.allclose(kd_lg, np.full(NUM_JOINTS, 0.15)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -302,6 +328,21 @@ def test_action_scale():
     check("python action_scale=0.25", cfg.action_scale == 0.25)
 
 
+def test_keyboard_mapping():
+    """GLFW key codes: UP=265, DOWN=264 (266 is PAGE_UP and silently no-ops)."""
+    from deploy_mujoco import KeyboardHandler
+    k = KeyboardHandler()
+    k.feed_key(265)  # ↑
+    k.process_keys()
+    check("keyboard UP -> vx>0", k.get_command().vx > 0.0)
+    k.feed_key(264)  # ↓
+    k.process_keys()
+    check("keyboard DOWN -> vx<0", k.get_command().vx < 0.0)
+    k.feed_key(48)  # 0
+    k.process_keys()
+    check("keyboard 0 -> stop", k.get_command().vx == 0.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. RuntimeState — verify all C++ states exist in Python
 # ═══════════════════════════════════════════════════════════════════════════
@@ -310,8 +351,8 @@ def test_runtime_state_enum():
     from deploy_mujoco import RuntimeState
     states = set(s.name for s in RuntimeState)
     expected = {"WaitFeedback", "Ready", "EnteringPosition", "ActivePC",
-                "ActiveRL", "LowGainTest", "DampingFault"}
-    check("all 7 states present", states == expected)
+                "ActiveRL", "LowGainTest", "DampingFault", "StandingUp"}
+    check("all 8 states present", states == expected)
     # Verify value ordering matches C++
     check("WaitFeedback=0", RuntimeState.WaitFeedback.value == 0)
     check("Ready=1", RuntimeState.Ready.value == 1)
@@ -320,6 +361,7 @@ def test_runtime_state_enum():
     check("ActiveRL=4", RuntimeState.ActiveRL.value == 4)
     check("LowGainTest=5", RuntimeState.LowGainTest.value == 5)
     check("DampingFault=6", RuntimeState.DampingFault.value == 6)
+    check("StandingUp=7", RuntimeState.StandingUp.value == 7)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,6 +375,7 @@ def main() -> int:
     test_target_computation()
     test_pd_control()
     test_action_scale()
+    test_keyboard_mapping()
     test_runtime_state_enum()
 
     print(f"\nResults: {passed} passed, {failed} failed")

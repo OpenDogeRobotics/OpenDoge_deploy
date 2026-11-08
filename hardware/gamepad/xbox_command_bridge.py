@@ -22,6 +22,39 @@ from opendoge_joystick import (
 STOP = False
 
 
+def apply_button_profile(mapper: XboxCommandMapper, args: argparse.Namespace,
+                         device_name: str) -> None:
+    """Apply native Zikway 3537:1041 button layout when appropriate.
+
+    Native js0 mapping (aligned with sim2sim and docs/lainlab_deploy_migration.md):
+      A=0, B=1, X=3, Y=4, LB/START=6, RB/BACK=7.
+    Hardware-only latching emergency stop: btn11, the key with three parallel
+    horizontal bars to the right of Home (not used by sim2sim).
+    Explicit --btn-* arguments always win.
+    """
+    use_zikway = args.profile == "zikway" or (
+        args.profile == "auto" and "zikway" in (device_name or "").lower()
+    )
+    if not use_zikway:
+        return
+    if args.btn_a is None:
+        mapper.btn_a = 0
+    if args.btn_b is None:
+        mapper.btn_b = 1
+    if args.btn_x is None:
+        mapper.btn_x = 3
+    if args.btn_y is None:
+        mapper.btn_y = 4
+    if args.btn_start is None:
+        mapper.btn_start = 6
+    if args.btn_back is None:
+        mapper.btn_back = 7
+    if args.btn_rb is None:
+        mapper.btn_rb = 11
+    if args.btn_estop is None:
+        mapper.btn_estop = 11
+
+
 def handle_signal(_signum, _frame) -> None:
     global STOP
     STOP = True
@@ -35,9 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/tmp/opendoge_command.state", help="Command file to write")
     parser.add_argument("--rate-hz", type=float, default=100.0, help="Command output update rate")
     parser.add_argument("--deadzone", type=float, default=0.08, help="Joystick axis deadzone")
-    parser.add_argument("--max-vx", type=float, default=0.6, help="Max forward speed command in m/s")
-    parser.add_argument("--max-vy", type=float, default=0.4, help="Max lateral speed command in m/s")
-    parser.add_argument("--max-yaw-rate", type=float, default=1.0, help="Max yaw rate command in rad/s")
+    # Full baseline 0.6/0.4/1.0. Bring-up used 75% then 50%; reverted to 100%
+    # on 2026-11-04. LainLab flat training starts at vx ±0.8 / vy ±0.5 /
+    # yaw ±0.8, so vx/vy are inside; yaw 1.0 is at/above the initial range —
+    # lower --max-yaw-rate if full-stick turning is unstable.
+    parser.add_argument("--max-vx", type=float, default=0.45, help="Max forward speed command in m/s (default 50% 0.60)")
+    parser.add_argument("--max-vy", type=float, default=0.25, help="Max lateral speed command in m/s (default 50% 0.40)")
+    parser.add_argument("--max-yaw-rate", type=float, default=0.70, help="Max yaw rate command in rad/s (default 50% 1.00)")
     parser.add_argument("--axis-vy", type=int, default=0, help="Axis number for lateral command")
     parser.add_argument("--axis-vx", type=int, default=1, help="Axis number for forward command")
     parser.add_argument("--axis-yaw", type=int, default=2, help="Axis number for yaw command (right stick X)")
@@ -48,6 +85,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--btn-back", type=int, default=None, help="Button number for BACK (default: 6)")
     parser.add_argument("--btn-start", type=int, default=None, help="Button number for START (default: 7)")
     parser.add_argument("--btn-rb", type=int, default=None, help="Button number for RB (default: 5)")
+    parser.add_argument(
+        "--btn-estop",
+        type=int,
+        default=None,
+        help="Latching emergency-stop button (Zikway profile: 11). "
+             "Press once to set estop; press A to clear it.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["auto", "default", "zikway"],
+        default="auto",
+        help="Button profile: auto detects Zikway 3537:1041 native js0; "
+             "default uses Xbox/xboxdrv numbering",
+    )
     parser.add_argument(
         "--require-rb",
         action="store_true",
@@ -83,6 +134,7 @@ def main() -> int:
         btn_back=args.btn_back,
         btn_start=args.btn_start,
         btn_rb=args.btn_rb,
+        btn_estop=args.btn_estop,
     )
 
     period_s = 1.0 / max(args.rate_hz, 1.0)
@@ -103,16 +155,18 @@ def main() -> int:
         try:
             with LinuxJoystick(current_device) as joystick:
                 name = joystick.name() or "unknown joystick"
+                apply_button_profile(mapper, args, name)
                 print(f"Joystick: {current_device} ({name})")
+                print(f"Profile:  {args.profile} (Zikway native mapping applied when detected)")
                 print(f"Writing:  {args.output}")
                 print(f"Rate:     {args.rate_hz} Hz")
-                print(f"Button mapping: A=btn{mapper.btn_a} B=btn{mapper.btn_b} X=btn{mapper.btn_x} Y=btn{mapper.btn_y} BACK=btn{mapper.btn_back} START=btn{mapper.btn_start} RB=btn{mapper.btn_rb}")
+                print(f"Button mapping: A=btn{mapper.btn_a} B=btn{mapper.btn_b} X=btn{mapper.btn_x} Y=btn{mapper.btn_y} BACK=btn{mapper.btn_back} START=btn{mapper.btn_start} ESTOP=btn{mapper.btn_estop}")
                 print(f"Axis mapping:   vx=axis{mapper.axis_vx} vy=axis{mapper.axis_vy} yaw=axis{mapper.axis_yaw}")
                 print("Controls:")
                 print("  Left stick   -> vx (前后) / vy (左右)")
                 print("  Right stick  -> yaw_rate (转向)")
                 print("  A            -> 启动机器人 + 位置控制模式 (position_control)")
-                print("  B            -> 机器人失能 / 电机保护 (active=false)")
+                print("  B            -> 退出位置控制/RL，回到阻尼 (active=false；不切断电机输出)")
                 print("  X            -> 进入 RL 推理状态 (rl_inference)")
                 print("  Y            -> 退出 RL 推理状态")
                 print("  BACK         -> 急停 (estop)")

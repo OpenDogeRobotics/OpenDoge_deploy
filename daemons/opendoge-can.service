@@ -1,21 +1,35 @@
 [Unit]
-Description=OpenDoge CAN Interface Setup (can0-3)
+Description=OpenDoge CAN Interface Setup (can0-3, native SocketCAN)
 Documentation=https://github.com/Lain-Ego/OpenDoge_firmware
-# Wait until USB subsystem is ready (CANable adapters are USB)
-After=multi-user.target
-Wants=multi-user.target
+# Do NOT order after multi-user.target: the bridge units used to be
+# WantedBy=multi-user and Require=this unit, which created an ordering cycle.
+After=systemd-udevd.service local-fs.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Optional overrides:
+#   CAN_EXPECT_DRIVER=gs_usb|<vendor driver>|auto   (auto = warn only)
+#   CAN_MODULE=<kernel module>                      (e.g. a vendor USB-CAN module)
+EnvironmentFile=-/etc/default/opendoge-can
+# USB enumeration of 4-channel adapters can take longer than 15 s.
+TimeoutStartSec=180
 
-# Load kernel modules
+# Load kernel modules (best effort). A vendor module can be set in
+# /etc/default/opendoge-can via CAN_MODULE=...
 ExecStartPre=-/sbin/modprobe gs_usb
 ExecStartPre=-/sbin/modprobe can
 ExecStartPre=-/sbin/modprobe can_raw
+ExecStartPre=-/bin/sh -c 'if [ -n "$${CAN_MODULE:-}" ]; then /sbin/modprobe "$${CAN_MODULE}" || true; fi'
 
-# Wait up to 15s for all 4 CAN interfaces to appear (USB enumeration)
-ExecStartPre=/bin/sh -c 'for i in $$(seq 1 30); do \
+# CHIWU exposes four separate gs_usb USB devices. If they enumerate as
+# can4-can7 (because can0-3 were used earlier in the boot), rename the four
+# CHIWU adapters to can0-can3 by USB path. No-op when already can0-can3.
+ExecStartPre=__REPO_ROOT__/scripts/prepare_can_interfaces.sh
+
+# Wait up to 60s for all 4 CAN interfaces to appear (USB enumeration)
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do \
     [ -e /sys/class/net/can0 ] && [ -e /sys/class/net/can1 ] && \
     [ -e /sys/class/net/can2 ] && [ -e /sys/class/net/can3 ] && exit 0; \
     sleep 0.5; \
@@ -24,16 +38,16 @@ missing=""; \
 for iface in can0 can1 can2 can3; do \
     [ -e /sys/class/net/$${iface} ] || missing="$${missing} $${iface}"; \
 done; \
-echo "CAN interfaces not found after 15s:$${missing} (check USB-CAN adapters)" >&2; \
+echo "CAN interfaces not found after 60s:$${missing} (check USB-CAN adapter/driver)" >&2; \
 exit 1'
 
-# Bring up all 4 CAN interfaces at 1 Mbps
-ExecStart=/bin/sh -c 'for iface in can0 can1 can2 can3; do \
-    ip link set down $${iface} 2>/dev/null || true; \
-    ip link set $${iface} type can bitrate 1000000 loopback off; \
-    ip link set up $${iface}; \
-    echo "$${iface} up at 1000000 bps"; \
-done'
+# Bring up all 4 CAN interfaces as classic CAN at 1 Mbps.
+# EL05 uses classic frames: fd must stay off.
+# CAN_EXPECT_DRIVER: gs_usb (default), a vendor driver name, or "auto"
+# (only warn). The script retries with a gs_usb USB authorized reset if
+# `ip link set up` fails, e.g. after the CHIWU board was power-cycled:
+#   gs_usb ... can0: Couldn't start device (err=-110)
+ExecStart=__REPO_ROOT__/scripts/setup_can_interfaces.sh
 
 # Keep interfaces up on restart (avoid flap)
 ExecStop=/bin/true

@@ -509,3 +509,244 @@ Python 目标计算块未处理 LowGainTest。
 | SafetyConfig/DeployConfig 重复 | 已消除 (SafetyConfig 删除) | N/A | ✅ |
 | RuntimeState 位置 | types.hpp | deploy_mujoco.py RuntimeState | ✅ |
 | 回归测试 | C++ build + dry-run | deploy_gap_regression.py (53 项) | ✅ |
+
+---
+
+## Round 4: LainLab / mjlab 训练侧对齐 (2026-10-19)
+
+Round 1-3 对齐的是旧 UniLab 训练管线 (49 维观测, `opendoge_r5.onnx`)。
+新模型在 `../LainLab` 用 mjlab 训练，观测与执行器契约均不同，部署侧已切换到
+新契约。以下为完整差异与修复记录。
+
+### Gap 20: 观测维度与字段顺序
+
+**严重程度**: 🔴 致命
+
+| 项目 | LainLab 训练 | 部署 (Round 3 及以前) |
+|------|-------------|----------------------|
+| 维度 | **48** | 49 |
+| 字段 | `base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)` | `gyro(3) + gravity(3) + q(12) + dq(12) + action(12) + cmd(3) + feet_phase(4)` |
+| 步态相位 | **不存在** (端到端策略) | 4 维相位 |
+| base_lin_vel | 存在 | 不存在 |
+
+**修复**: `buildObservation()` 改为 48 维 LainLab 布局。旧 49 维布局保留为
+`buildLegacyObservation()` 仅供调试，不得用于推理。
+
+### Gap 21: 关节符号约定
+
+**严重程度**: 🔴 致命
+
+训练 URDF 与固件 URDF 的关节轴方向存在镜像。部署逻辑位置/速度必须乘
+`kJointSign` 才能映射到训练约定：
+
+```cpp
+constexpr std::array<double, kNumJoints> kJointSign = {
+  +1,+1,+1,  +1,-1,-1,  -1,+1,+1,  -1,-1,-1 };
+// FL            FR            RL            RR
+```
+
+规律: FR thigh/calf、RL/RR hip、RR thigh/calf 与固件方向相反。
+
+- 观测: `obs_pos = sign * (q_fw - default_fw)`, `obs_vel = sign * qd_fw`
+- 动作: `target_fw = default_fw + sign * 0.25 * action_train`
+- `last_action` 观测: **不做符号翻转**, 存原始策略输出
+
+### Gap 22: 默认姿态
+
+**严重程度**: 🔴 致命
+
+| 项目 | 训练 (LainLab `default_joint_pos`) | 固件旧值 |
+|------|-----------------------------------|----------|
+| FL/FR thigh | 0.8 | 0.5 |
+| RL/RR thigh | 0.8 | 0.7 |
+| calf | -1.6 | -1.3 |
+| hip | 0.0 | 0.0 |
+
+**修复**: `defaultJointPosition()` 与 `DEFAULT_POS` 统一为每腿 `(0, 0.8, -1.6)`。
+注意这是**固件约定**下的值，已含符号映射。
+
+### Gap 23: PD 增益与执行器模型
+
+**严重程度**: 🔴 致命
+
+| 项目 | LainLab | 部署旧值 |
+|------|---------|----------|
+| stiffness (kp) | 12.0 | 20.0 |
+| damping (kd) | 0.5 | 0.3 |
+| armature | 0.005 | 0.01 |
+| joint damping | 0 (由执行器 PD 提供) | 0.5 (重复阻尼) |
+| joint frictionloss | 0 | 0.2 |
+
+**修复**: `kp=12.0`, `kd=0.5`; XML joint 默认改为
+`damping="0" frictionloss="0" armature="0.005"`。若固件 XML 保留 joint
+damping=0.5，会与 PD kd=0.5 叠加，实测行走速度从 0.36 掉到 0.13 m/s。
+
+### Gap 24: 动作裁剪
+
+**严重程度**: 🔴 致命
+
+mjlab `JointPositionAction` 直接 `raw * 0.25 + default`，**不裁剪**；
+`last_action` 观测也是 raw 输出。部署侧此前仍有 `clamp(-1,1)`。
+
+**修复**: ONNX 输出、`last_action`、目标计算三处全部移除裁剪。
+实测策略输出范围约 `[-3.8, +3.3]`。
+
+### Gap 25: 脚部接触参数
+
+**严重程度**: 🔴 致命
+
+LainLab `FULL_COLLISION` 脚部参数与固件旧值不同：
+
+| 属性 | LainLab | 固件旧值 |
+|------|---------|----------|
+| friction | `0.8 0.005 0.0001` | `0.4 0.02 0.01` |
+| solimp | `0.9 0.95 0.023` | `0.015 1 0.023` |
+| condim | 3 | 6 |
+
+**修复**: 4 个 foot sphere geom 全部对齐。只改脚部参数时行走速度 0.13→0.19
+m/s；连同 joint damping 一起改才恢复到 0.36 m/s。
+
+### Gap 26: MuJoCo 传感器地址索引
+
+**严重程度**: 🔴 致命 (仿真侧 bug, 影响所有结论)
+
+原代码用 `model.sensor(name).id` 作为 `sensordata` 偏移，但 MuJoCo 的
+`sensordata` 偏移是 `model.sensor_adr[id]`。结果固件模型读到的是 `position`
+传感器而非 gyro，LainLab 模型读到的是 `imu_lin_acc` 而非 `imu_lin_vel`。
+
+**修复**:
+```python
+def sensor_adr(name):
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
+    return None if sid < 0 else int(model.sensor_adr[sid])
+```
+
+### Gap 27: 训练模型无 actuator + 缺 armature
+
+**严重程度**: 🟡 中等 (仅仿真)
+
+LainLab MJCF `nu=0`，PD 力矩必须写 `data.qfrc_applied[dof]` 而非 `data.ctrl`。
+mjlab 在运行时注入 armature，裸 MuJoCo 加载时需要手动设置
+`model.dof_armature = 0.005`，否则小腿 (低惯量) 显式积分发散 (QACC NaN)。
+
+### base_lin_vel 消融实验
+
+真机只有 IMU，无法直接测线速度。训练时 `base_lin_vel` 加了
+`U(-0.5, +0.5) m/s` 噪声，因此对缺失线速度应当有较强鲁棒性。
+`deploy_mujoco.py` 新增 `--lin-vel-mode {true,zero,command,noisy}`,
+C++ 新增 `--lin-vel-source {zero,command,imu}` / `lin_vel_source` 配置项。
+
+在 LainLab 模型上 10 s 测试结果 (±0.5 m/s 噪声, seed 固定):
+
+| 场景 | true | zero | command | noisy |
+|------|------|------|---------|-------|
+| vx=0.4: 实际 vx (m/s) | 0.353 | 0.377 | 0.350 | 0.353 |
+| vy=0.3: 实际 vy (m/s) | 0.262 | 0.268 | 0.261 | 0.262 |
+| vx=0.3, wz=0.5: 实际 wz | 0.494 | 0.497 | 0.499 | 0.498 |
+| 倒地 | 无 | 无 | 无 | 无 |
+| 峰值力矩 (N·m) | 3.0-3.5 | 3.0-3.5 | 3.0-3.5 | 3.0-3.5 |
+
+**结论**: 策略对 `base_lin_vel` 来源几乎不敏感。`zero` 与 `true` 差异在
+训练噪声范围内，直线速度甚至略优。部署默认取 `command` (指令速度作为
+机体速度近似)，`zero` 可作为最保守回退。
+
+### Round 4 对齐后的最终状态
+
+| 项目 | LainLab 训练 | C++ 部署 | Python 仿真 | 状态 |
+|------|-------------|----------|-------------|:----:|
+| 观测维度 | 48 | 48 | 48 | ✅ |
+| 观测字段顺序 | lin_vel + ang_vel + gravity + q + dq + action + cmd | 同 | 同 | ✅ |
+| base_lin_vel | 有 | `zero`/`command`/`imu` 可配 | `true`/`zero`/`command`/`noisy` | ✅ |
+| 关节符号 | 训练约定 | `kJointSign` 映射 | `JOINT_SIGN` 映射 | ✅ |
+| 默认姿态 | `(0, 0.8, -1.6)` ×4 | 同 (固件约定) | 同 | ✅ |
+| kp / kd | 12.0 / 0.5 | 12.0 / 0.5 | 12.0 / 0.5 | ✅ |
+| action_scale | 0.25 | 0.25 | 0.25 | ✅ |
+| 动作裁剪 | 无 | 无 | 无 | ✅ |
+| joint damping / frictionloss / armature | 0 / 0 / 0.005 | 0 / 0 / 0.005 | 0 / 0 / 0.005 | ✅ |
+| 脚部 friction / solimp / condim | 0.8 / 0.9 0.95 0.023 / 3 | 同 | 同 | ✅ |
+| 步态相位 | 无 | 无 (legacy 保留) | 无 | ✅ |
+| 回归测试 | — | — | `deploy_gap_regression.py` (51 项) | ✅ |
+
+### 剩余风险
+
+| 风险 | 说明 |
+|------|------|
+| Calf 力矩上限 | LainLab 训练 effort limit 9 N·m，EL05 只有 6 N·m。策略若长时间饱和在小腿会被限幅 |
+| 关节限位 | 2026-11-06（修改 54）已把固件 XML/deploy 限位对齐训练值，并保留实机手掰余量（RL/RR thigh 下限 −0.85）；仍需实机验证放宽后的姿态不会自碰撞 |
+| 质量分布 | 固件 XML 与训练 XML 的 base 惯量/质心尚未逐项核对 |
+| IMU 线速度 | `dm_imu_bridge.py` 目前不输出 `vx/vy/vz`，`imu` 模式实际等价于 `zero` |
+| 摩擦锥 | 训练 `cone=elliptic impratio=100`，固件 XML 已对齐 |
+
+---
+
+## Round 5: projected_gravity 旋转方向修正 (2026-11-03)
+
+### Gap 28: sim2sim 的 projected_gravity 用了正向旋转
+
+**严重程度**: 🔴 致命（仿真观测与训练不一致，但不影响真机）
+
+| 管线 | 定义 | 低头 20° 的 `gx` |
+|------|------|------------------|
+| 训练 mjlab | `quat_apply_inverse(root_link_quat_w, (0,0,-1))` = `R^T·g` | **+0.342** |
+| sim2sim（修复前） | `_rotate_vector_by_quat((0,0,-1), framequat)` = `R·g` | **-0.342** |
+| 真机 bridge | `quat_rotate_inverse(quat, (0,0,-1))` = `R^T·g` | **+0.342** |
+
+`framequat`/`qpos` 四元数是 body→world；直接用它做正向旋转会把 `gx/gy`
+的符号翻反。真机实测“抬头 `gx<0`、低头 `gx>0`”与训练一致，确认是 sim2sim
+侧写错。
+
+**修复**: 新增 `_rotate_vector_by_quat_inverse()`（与 mjlab
+`quat_apply_inverse` 同公式），`get_imu()` 改用它。
+
+**验证**: 数值与 mjlab venv 一致；`--mode rl --cmd 0 0 0.75 --lin-vel-mode zero`
+跑 4 s：`base_yaw=2.91`、平均 `wz=0.727`、`z` 稳定、无 fault、峰值力矩 2.61 N·m。
+
+**注意**: 之前基于旧 sim2sim 做的所有“策略在仿真里正常”的结论，
+在 pitch/roll 相关项上是用镜像后的重力得到的；修复后需重新评估。
+
+---
+
+## Round 6: 起身交接稳定段与目标淡入 (2026-11-06，修改 55)
+
+### 背景
+
+真机装电池后，起身斜坡结束、交接给策略的瞬间，第一帧策略动作可能很大
+（`raw × 0.25`，raw 可达 ±3）；`ActiveRL` 原本 `limited_target = logical_target`
+瞬时到位，calf 目标会跳变 0.5–0.9 rad，产生“噔”一下和 gz 尖峰，触发 IMU
+倒地检测误报。
+
+### 修改（C++ 与 sim2sim 同步）
+
+- `StandingUp` 斜坡到默认姿态后再保持 `standup_settle_s`（默认 1 s）才交接；
+- 交接后 `standup_handover_s`（默认 1 s）内，目标从默认姿态按 alpha 淡入策略
+  动作，并在这段时间保留 rate limiter（正常 `ActiveRL` 仍不 rate limit）；
+- 倒地检测的 `standup_grace_s` 改为**时间窗**（从进入起立开始计，默认 6.5 s），
+  不再绑定当前状态，覆盖“斜坡 + 稳定 + 交接”；
+- `sim2sim/deploy_mujoco.py` 的 `DeployConfig`、`StandingUp` 状态机、目标块同步了
+  `standup_settle_s`、`standup_handover_s` 和淡入逻辑；回归测试新增交接淡入检查
+  （59 passed）。
+- 仿真验证：`--mode rl --policy policy/opendoge_flat.onnx --duration 9
+  --max-deviation 0.25` 从趴伏起身，5.002 s 交接，calf target 在交接窗口内
+  平滑变化（max |Δ|/row ≈ 0.0006），无瞬跳。
+
+### 注意
+
+这是一次性偏离训练契约（只在交接窗口内），之后 `ActiveRL` 仍按训练的无
+rate limit 瞬时目标运行。实机重点验证：交接瞬间 `target` 是否连续、calf
+是否不再弹、`fall detected` 是否消失。
+
+---
+
+## Round 7: 观测延迟/丢包注入 (2026-11-06，修改 58)
+
+- `--imu-delay-ms` / `--joint-delay-ms`：只在 `build_observation` 的采样点使用
+  历史 ring buffer；PD/plant 仍用当前状态。0 时完全走原路径（零延迟等价）。
+- `--packet-loss` + `--loss-burst-ms` + `--loss-target {joint,bus,all}`：在
+  200 Hz target tick 更新 hold 状态；丢包时观测保持上一帧 q/dq。
+- `--cmd-loss`：在 target tick 决定，控制块保持上一 `limited_target`，模拟电机
+  保持上一条 CAN 命令。
+- 延迟分辨率 = `model.opt.timestep`；固件 XML 默认 0.002，LainLab XML 是 0.01
+  （5/10 ms 不可表示）。扫 5/10 ms 时需要更小 timestep 或接受量化。
+- 验证：`--mode idle`、`--mode rl --max-deviation 0.25 --imu-delay-ms 10
+  --joint-delay-ms 5`、`--packet-loss 0.05 --loss-burst-ms 20 --cmd-loss 0.02`
+  均可起身到 ActiveRL，无崩溃。

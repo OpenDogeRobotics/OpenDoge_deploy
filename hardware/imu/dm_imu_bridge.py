@@ -35,6 +35,13 @@ class ImuState:
     quat: Optional[Tuple[float, float, float, float]] = None
     accel: Optional[Tuple[float, float, float]] = None
     last_update_s: float = 0.0
+    # Per-component receipt times/sequences. A single global sequence can be
+    # advanced by an accel frame while the gyro/quat are frozen; the deploy
+    # needs to see each path separately.
+    gyro_time_s: float = 0.0
+    quat_time_s: float = 0.0
+    gyro_seq: int = 0
+    quat_seq: int = 0
 
     def ready(self) -> bool:
         return self.gyro is not None and self.quat is not None
@@ -91,17 +98,26 @@ def remap_quat(q: Tuple[float, float, float, float], order, signs) -> Tuple[floa
 
 
 def atomic_write(path: str, text: str) -> None:
+    # Latest-value IPC file: the deploy polls it at 200 Hz. fsync on ext4
+    # (/tmp is not tmpfs here) is unnecessary for this and very costly at 1 kHz.
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{path}.tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as file:
         file.write(text)
         file.flush()
-        os.fsync(file.fileno())
     os.replace(tmp_path, path)
 
 
-def format_imu_state(gyro: Tuple[float, float, float], gravity: Tuple[float, float, float]) -> str:
+def format_imu_state(
+    gyro: Tuple[float, float, float],
+    gravity: Tuple[float, float, float],
+    stamp_s: float = 0.0,
+    gyro_time_s: float = 0.0,
+    quat_time_s: float = 0.0,
+    gyro_seq: int = 0,
+    quat_seq: int = 0,
+) -> str:
     return (
         f"wx={gyro[0]:.9f}\n"
         f"wy={gyro[1]:.9f}\n"
@@ -109,7 +125,20 @@ def format_imu_state(gyro: Tuple[float, float, float], gravity: Tuple[float, flo
         f"gx={gravity[0]:.9f}\n"
         f"gy={gravity[1]:.9f}\n"
         f"gz={gravity[2]:.9f}\n"
+        # Monotonic receipt timestamps (CLOCK_MONOTONIC; shared with the
+        # deploy's steady_clock on Linux). t is the latest frame; gyro_t/quat_t
+        # are per-component. seq lets the deploy detect a frozen component
+        # even when the bridge rewrites its cached sample every 5 ms.
+        f"t={stamp_s:.9f}\n"
+        f"gyro_t={gyro_time_s:.9f}\n"
+        f"gyro_seq={gyro_seq}\n"
+        f"quat_t={quat_time_s:.9f}\n"
+        f"quat_seq={quat_seq}\n"
     )
+
+
+class DeviceLostError(RuntimeError):
+    """USB serial device disappeared or was re-enumerated to a new tty."""
 
 
 class SerialActiveReader:
@@ -119,10 +148,12 @@ class SerialActiveReader:
         self.check_crc = check_crc
         self.fd: Optional[int] = None
         self.buffer = bytearray()
+        self.real_path: Optional[str] = None
 
     def __enter__(self) -> "SerialActiveReader":
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         configure_serial(self.fd, self.baud)
+        self.real_path = os.path.realpath(self.device)
         return self
 
     def __exit__(self, *_args) -> None:
@@ -133,10 +164,23 @@ class SerialActiveReader:
     def read_updates(self) -> Iterable[Tuple[int, Tuple[float, ...]]]:
         if self.fd is None:
             return []
+        # A /dev/serial/by-id symlink is retargeted on USB re-enumeration
+        # (ttyACM0 -> ttyACM1). The old fd then reads nothing forever, which
+        # showed up as "IMU update timeout" while the service stayed alive.
+        # Detect the retarget and let main() reopen the device.
+        try:
+            current = os.path.realpath(self.device)
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
+        if self.real_path and current != self.real_path:
+            raise DeviceLostError(
+                f"{self.device} -> {current} (was {self.real_path})")
         try:
             chunk = os.read(self.fd, 4096)
         except BlockingIOError:
             chunk = b""
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
         if chunk:
             self.buffer.extend(chunk)
         return parse_serial_frames(self.buffer, self.check_crc)
@@ -144,7 +188,10 @@ class SerialActiveReader:
     def write(self, data: bytes) -> None:
         if self.fd is None:
             raise RuntimeError("serial device is not open")
-        os.write(self.fd, data)
+        try:
+            os.write(self.fd, data)
+        except OSError as exc:
+            raise DeviceLostError(str(exc)) from exc
 
 
 def configure_serial(fd: int, baud: int) -> None:
@@ -300,13 +347,18 @@ def parse_can_data(data: bytes):
 
 
 def apply_update(state: ImuState, frame_type: int, values: Tuple[float, ...], order, signs) -> None:
+    now_s = time.monotonic()
     if frame_type == 0x01 and len(values) >= 3:
         state.accel = remap_vec((values[0], values[1], values[2]), order, signs)
     elif frame_type == 0x02 and len(values) >= 3:
         state.gyro = remap_vec((values[0], values[1], values[2]), order, signs)
+        state.gyro_time_s = now_s
+        state.gyro_seq += 1
     elif frame_type == 0x04 and len(values) >= 4:
         state.quat = remap_quat((values[0], values[1], values[2], values[3]), order, signs)
-    state.last_update_s = time.monotonic()
+        state.quat_time_s = now_s
+        state.quat_seq += 1
+    state.last_update_s = now_s
 
 
 def parse_args():
@@ -327,20 +379,70 @@ def parse_args():
     )
     parser.add_argument("--save-config", action="store_true", help="Save settings when used with --configure-usb")
     parser.add_argument("--check-crc", action="store_true", help="Validate USB serial CRC16 before accepting frames")
+    parser.add_argument(
+        "--gyro-lowpass-hz", type=float, default=0.0,
+        help="Low-pass filter cutoff for wx/wy/wz (0=off). 40-60 Hz suppresses "
+             "real-world foot-impact vibration; adds ~1/(2*pi*f) phase lag.")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
 
-def run(reader, output: str, order, signs, timeout_s: float, quiet: bool) -> int:
+def run(reader, output: str, order, signs, timeout_s: float, quiet: bool,
+        lowpass_hz: float = 0.0, write_min_interval_s: float = 0.002) -> int:
     state = ImuState()
     next_status_s = 0.0
+    last_write_s = 0.0
+    last_filter_s = 0.0
+    written_gyro_seq = 0
+    written_quat_seq = 0
+    filtered_gyro = None
     while True:
         for frame_type, values in reader.read_updates():
             apply_update(state, frame_type, values, order, signs)
-        if state.ready():
-            gravity = quat_rotate_inverse(state.quat, (0.0, 0.0, -1.0))  # type: ignore[arg-type]
-            atomic_write(output, format_imu_state(state.gyro, gravity))  # type: ignore[arg-type]
         now_s = time.monotonic()
+        gyro_updated = state.gyro_seq != written_gyro_seq
+        quat_updated = state.quat_seq != written_quat_seq
+        # Write as soon as a new gyro/quat sample is available, capped at
+        # `write_min_interval_s`. The DM-IMU-L1 outputs gyro and quat at
+        # ~1 kHz here; writing every frame (~2 kHz atomic_write+rename) makes
+        # the bridge itself a scheduling/disk load and was observed to cause
+        # 40-130 ms IMU age spikes. The deploy inference is 100 Hz, so a 2 ms
+        # cap (500 Hz, age <= 2 ms) still removes most of the old 5 ms gate
+        # without the file churn.
+        if (state.ready() and (gyro_updated or quat_updated) and
+                (write_min_interval_s <= 0.0 or
+                 now_s - last_write_s >= write_min_interval_s)):
+            gravity = quat_rotate_inverse(state.quat, (0.0, 0.0, -1.0))  # type: ignore[arg-type]
+            gyro = state.gyro
+            if lowpass_hz > 0.0 and gyro is not None:
+                # First-order IIR per written sample; use the measured write
+                # interval so the cutoff does not depend on the write cap.
+                # Default off so the training contract (raw rad/s gyro) is
+                # unchanged; 40-60 Hz is a useful sim2real filter for
+                # foot-impact vibration.
+                if gyro_updated:
+                    dt = now_s - last_filter_s if last_filter_s > 0.0 else 0.005
+                    dt = min(max(dt, 0.001), 0.02)
+                    alpha = 1.0 - math.exp(-2.0 * math.pi * lowpass_hz * dt)
+                    if filtered_gyro is None:
+                        filtered_gyro = list(gyro)
+                    else:
+                        for i in range(3):
+                            filtered_gyro[i] += alpha * (gyro[i] - filtered_gyro[i])
+                    last_filter_s = now_s
+                if filtered_gyro is not None:
+                    gyro = tuple(filtered_gyro)
+            atomic_write(output, format_imu_state(
+                gyro, gravity,  # type: ignore[arg-type]
+                stamp_s=state.last_update_s,
+                gyro_time_s=state.gyro_time_s,
+                quat_time_s=state.quat_time_s,
+                gyro_seq=state.gyro_seq,
+                quat_seq=state.quat_seq,
+            ))
+            last_write_s = now_s
+            written_gyro_seq = state.gyro_seq
+            written_quat_seq = state.quat_seq
         if not quiet and now_s >= next_status_s:
             age = now_s - state.last_update_s if state.last_update_s else float("inf")
             print(f"ready={int(state.ready())} age_ms={age * 1000.0:.1f} output={output}")
@@ -358,12 +460,30 @@ def main() -> int:
             if not args.device:
                 print("--device is required for --source serial", file=sys.stderr)
                 return 1
-            with SerialActiveReader(args.device, args.baud, args.check_crc) as reader:
-                if args.configure_usb:
-                    send_usb_setup(reader, args.save_config)
-                return run(reader, args.output, order, signs, args.timeout_sec, args.quiet)
-        with CanReader(args.can, args.can_id) as reader:
-            return run(reader, args.output, order, signs, args.timeout_sec, args.quiet)
+            factory = lambda: SerialActiveReader(  # noqa: E731
+                args.device, args.baud, args.check_crc)
+            configure = args.configure_usb
+            label = args.device
+        else:
+            factory = lambda: CanReader(args.can, args.can_id)  # noqa: E731
+            configure = False
+            label = args.can
+
+        # USB re-enumeration (ttyACM0 -> ttyACM1) invalidates the open fd.
+        # The old loop kept the dead fd and printed "IMU update timeout"
+        # forever; reopen and re-send --configure-usb instead.
+        while True:
+            try:
+                with factory() as reader:
+                    if configure:
+                        send_usb_setup(reader, args.save_config)
+                    return run(reader, args.output, order, signs,
+                               args.timeout_sec, args.quiet,
+                               args.gyro_lowpass_hz)
+            except (DeviceLostError, FileNotFoundError, OSError) as exc:
+                print(f"[reconnect] IMU lost ({label}): {exc}; "
+                      f"waiting for device ...", file=sys.stderr)
+                time.sleep(1.0)
     except KeyboardInterrupt:
         return 0
 

@@ -104,10 +104,13 @@ CHANNEL_MOTOR_IDS = {
     "can3": [10, 11, 12],
 }
 
+# 0x3022 faultSta bit definitions (manual §3.3.7). NOT the same layout as the
+# type-2 status frame's 6-bit fault field (CAN-ID bit21:16), where bit0=欠压,
+# bit1=三相电流, bit2=过温, …; keep the two mappings separate.
 FAULT_NAMES = {
-    0: "欠压",
+    0: "过温",
     1: "驱动芯片",
-    2: "过温",
+    2: "欠压",
     3: "过压",
     4: "B相过流",
     5: "C相过流",
@@ -243,15 +246,23 @@ class El05Bus:
             if comm_type == COMM_GET_DEVICE_ID:
                 motor_id = data2 & 0xFF
                 found.add(motor_id)
-        if not found:
-            for mid in range(1, 128):
-                self.send(COMM_GET_DEVICE_ID, mid, [0] * 8)
+        # 广播可能只收到部分回复：多个电机同时应答时，USB2CAN 串口路径
+        # 可能只转发其中一帧。不能因为找到一个就认为总线只有这一个；
+        # 对未发现的 ID 逐个补扫。
+        for mid in range(1, 128):
+            if mid in found:
+                continue
+            self.send(COMM_GET_DEVICE_ID, mid, [0] * 8)
+            for _ in range(3):
                 frame = self.recv(0.03)
-                if frame:
-                    can_id, _payload = frame
-                    comm_type, data2, _target = parse_ext_id(can_id)
-                    if comm_type == COMM_GET_DEVICE_ID:
-                        found.add(data2 & 0xFF)
+                if frame is None:
+                    break
+                can_id, _payload = frame
+                comm_type, data2, _target = parse_ext_id(can_id)
+                if comm_type == COMM_GET_DEVICE_ID:
+                    found.add(data2 & 0xFF)
+                    if (data2 & 0xFF) == mid:
+                        break
         return sorted(found)
 
     def set_can_id(self, motor_id: int, new_id: int) -> Optional[MotorStatus]:
@@ -447,7 +458,11 @@ def read_float(prompt: str, default: float, low: float, high: float) -> Optional
 
 def prompt_ids_with_discover(bus: El05Bus, motors: list[tuple[str, int]],
                              channel: str = "") -> Optional[list[int]]:
-    """先扫描总线, 列出在线电机供选择。返回所选 ID 列表, 空列表=退出。"""
+    """先扫描总线, 列出在线电机供选择。返回所选 ID 列表, 空列表=退出。
+
+    ⚠️ 数值输入一律按 **电机 ID** 解释；列表序号用 `#N`（0-based）。
+    旧版本把数值先当索引，can0 在线 [1,2,3] 时输入 "1" 会误选 ID 2 (FL_thigh)。
+    """
     print("正在扫描总线 (只读)...")
     bus.drain()
     online = bus.discover(timeout=1.5)
@@ -462,39 +477,64 @@ def prompt_ids_with_discover(bus: El05Bus, motors: list[tuple[str, int]],
     }
     suggested = channel_targets.get(channel, (1, 2, 3))
 
-    known = {mid: name for name, mid in motors}
+    # 名称按全部 12 个标准 ID 映射，避免 --ids 过滤时把 2/3 号误标为“非标准”
+    known = {mid: name for name, mid in DEFAULT_MOTORS}
+    name_to_id = {name: mid for name, mid in DEFAULT_MOTORS}
     print(f"\n当前总线在线电机:")
-    for mid in online:
+    for idx, mid in enumerate(online):
         name = known.get(mid, "")
         id_hint = ""
         if mid not in known:
             # 给非标准ID建议一个目标ID
-            unused = [t for t in suggested if t not in [m for m in online if m in known]]
+            unused = [t for t in suggested if t not in online]
             hint_id = unused[0] if unused else suggested[0]
             id_hint = f" → 建议改为 {hint_id}"
         pos = bus.read_param_float(mid, IDX_MECH_POS, timeout=0.3)
         pos_str = f"  位置={pos:+.4f} rad" if pos is not None else ""
-        label = f"  [{online.index(mid)}] ID={mid:3d} {name}" if name else f"  [{online.index(mid)}] ID={mid:3d} (非标准,{id_hint})"
+        if name:
+            label = f"  [#{idx}] ID={mid:3d} {name}"
+        else:
+            label = f"  [#{idx}] ID={mid:3d} (非标准,{id_hint})"
         print(f"{label}{pos_str}")
 
     print(f"\n  输入 q 返回上级")
-    sel = input("选择电机 (输入编号或 ID): ").strip()
+    sel = input("选择电机 (输入 ID 或名称，列表序号用 #N，如 #0): ").strip()
     if sel.lower() in {"q", "quit", "exit", "返回", ""}:
         return []
-    try:
-        idx = int(sel)
+
+    # 名称
+    if sel in name_to_id:
+        mid = name_to_id[sel]
+        if mid not in online:
+            print(f"  ID {mid} ({sel}) 不在线（在线: {online}）")
+            return None
+        return [mid]
+
+    # 列表序号: #N（0-based）
+    if sel.startswith("#"):
+        try:
+            idx = int(sel[1:], 0)
+        except ValueError:
+            print(f"  无效序号: {sel}")
+            return None
         if 0 <= idx < len(online):
             return [online[idx]]
-    except ValueError:
-        pass
+        print(f"  序号超出范围 (0-{len(online) - 1}): {sel}")
+        return None
+
+    # 数值: 一律按电机 ID 解释
     try:
-        mid = int(sel)
-        if 1 <= mid <= 127:
-            return [mid]
+        mid = int(sel, 0)
     except ValueError:
-        pass
-    print(f"  无效选择: {sel}")
-    return None
+        print(f"  无效选择: {sel}")
+        return None
+    if not (1 <= mid <= 127):
+        print(f"  ID 超出范围 (1-127): {mid}")
+        return None
+    if mid not in online:
+        print(f"  ID {mid} 不在线（在线: {online}）")
+        return None
+    return [mid]
 
 
 # ============================================================

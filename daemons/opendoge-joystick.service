@@ -7,11 +7,16 @@ After=default.target
 
 [Service]
 Type=simple
+# Keep file-IPC writers off the deploy's realtime core (CPU 0).
+CPUAffinity=6 7
 # Wait up to 30s for xboxdrv to create /dev/input/js0
 ExecStartPre=/bin/sh -c 'for i in $$(seq 1 60); do [ -e /dev/input/js0 ] && exit 0; sleep 0.5; done; echo "js0 not found after 30s" >&2; exit 1'
+# --profile auto: Zikway 3537:1041 uses A=0/B=1/X=3/Y=4, START=6, BACK=7,
+# and latching emergency stop btn11. Press A after estop to clear it.
 ExecStart=/usr/bin/python3 /home/orangepi/Opendoge/OpenDoge_firmware/hardware/gamepad/xbox_command_bridge.py \
     --output /tmp/opendoge_command.state \
-    --require-rb
+    --profile auto \
+    --max-vx 0.50 --max-vy 0.40 --max-yaw-rate 0.70
 # Always restart — bridge has its own reconnection logic for js0 loss,
 # but a hard crash (e.g. Python interpreter abort) still needs systemd.
 Restart=always

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -90,6 +91,28 @@ bool getBool(
   return parseBool(it->second);
 }
 
+std::uint64_t getUint64(
+  const std::unordered_map<std::string, std::string> & values, const std::string & key,
+  std::uint64_t fallback)
+{
+  const auto it = values.find(key);
+  if (it == values.end() || it->second.empty()) {
+    return fallback;
+  }
+  return static_cast<std::uint64_t>(std::stoull(it->second));
+}
+
+std::string getString(
+  const std::unordered_map<std::string, std::string> & values, const std::string & key,
+  const std::string & fallback)
+{
+  const auto it = values.find(key);
+  if (it == values.end() || it->second.empty()) {
+    return fallback;
+  }
+  return it->second;
+}
+
 std::vector<double> parseNumbers(const std::string & text)
 {
   std::string normalized = text;
@@ -127,11 +150,44 @@ bool loadDeployConfig(
     config.kd = getDouble(values, "kd", config.kd);
     config.safe_kd = getDouble(values, "safe_kd", config.safe_kd);
     config.action_scale = getDouble(values, "action_scale", config.action_scale);
+    {
+      const auto it = values.find("lin_vel_source");
+      if (it != values.end() && !it->second.empty()) {
+        config.lin_vel_source = it->second;
+      }
+    }
     config.state_timeout_s = getDouble(values, "state_timeout_s", config.state_timeout_s);
+    config.feedback_retry_hz = getDouble(values, "feedback_retry_hz", config.feedback_retry_hz);
     config.over_temperature_c = getDouble(values, "over_temperature_c", config.over_temperature_c);
     config.fault_poll_hz = getDouble(values, "fault_poll_hz", config.fault_poll_hz);
     config.pc_startup_ramp_s = getDouble(values, "pc_startup_ramp_s", config.pc_startup_ramp_s);
     config.pc_startup_max_deviation = getDouble(values, "pc_startup_max_deviation", config.pc_startup_max_deviation);
+    config.low_gain_max_position_step = getDouble(
+      values, "low_gain_max_position_step", config.low_gain_max_position_step);
+    config.standup_max_position_step = getDouble(
+      values, "standup_max_position_step", config.standup_max_position_step);
+    config.standup_duration_s = getDouble(
+      values, "standup_duration_s", config.standup_duration_s);
+    config.standup_settle_s = getDouble(
+      values, "standup_settle_s", config.standup_settle_s);
+    config.standup_handover_s = getDouble(
+      values, "standup_handover_s", config.standup_handover_s);
+    config.standup_tracking_error_threshold = getDouble(
+      values, "standup_tracking_error_threshold", config.standup_tracking_error_threshold);
+    config.standup_tracking_error_timeout_s = getDouble(
+      values, "standup_tracking_error_timeout_s", config.standup_tracking_error_timeout_s);
+    config.torque_limit_nm = getDouble(values, "torque_limit_nm", config.torque_limit_nm);
+    config.can_timeout_s = getDouble(values, "can_timeout_s", config.can_timeout_s);
+    if (!std::isfinite(config.can_timeout_s) || config.can_timeout_s < 0.0) {
+      error = "can_timeout_s must be >= 0 (0 = disabled)";
+      return false;
+    }
+    // A timeout shorter than the startup/self-check gaps would reset the
+    // motors while they are being configured. 0 disables it.
+    if (config.can_timeout_s > 0.0 && config.can_timeout_s < 0.5) {
+      error = "can_timeout_s must be 0 (disabled) or >= 0.5 s";
+      return false;
+    }
     config.torque_threshold = getDouble(values, "torque_threshold", config.torque_threshold);
     config.torque_timeout_s = getDouble(values, "torque_timeout_s", config.torque_timeout_s);
     config.tracking_error_threshold = getDouble(values, "tracking_error_threshold", config.tracking_error_threshold);
@@ -139,6 +195,26 @@ bool loadDeployConfig(
     config.command_timeout_s = getDouble(values, "command_timeout_s", config.command_timeout_s);
     config.fall_gravity_z_threshold = getDouble(values, "fall_gravity_z_threshold", config.fall_gravity_z_threshold);
     config.fall_timeout_s = getDouble(values, "fall_timeout_s", config.fall_timeout_s);
+    config.standup_grace_s = getDouble(values, "standup_grace_s", config.standup_grace_s);
+    config.imu_timeout_s = getDouble(values, "imu_timeout_s", config.imu_timeout_s);
+    config.imu_stale_action = getString(values, "imu_stale_action", config.imu_stale_action);
+    config.feedback_hold_max_s = getDouble(
+      values, "feedback_hold_max_s", config.feedback_hold_max_s);
+    config.stale_action = getString(values, "stale_action", config.stale_action);
+    config.can_error_action = getString(values, "can_error_action", config.can_error_action);
+    if (config.imu_stale_action != "warn" && config.imu_stale_action != "fault") {
+      error = "imu_stale_action must be warn|fault";
+      return false;
+    }
+    if (config.stale_action != "hold" && config.stale_action != "freeze" &&
+        config.stale_action != "fault") {
+      error = "stale_action must be hold|freeze|fault";
+      return false;
+    }
+    if (config.can_error_action != "warn" && config.can_error_action != "fault") {
+      error = "can_error_action must be warn|fault";
+      return false;
+    }
     config.command_smoothing_alpha = getDouble(values, "command_smoothing_alpha", config.command_smoothing_alpha);
     config.feedback_wait_timeout_s = getDouble(values, "feedback_wait_timeout_s", config.feedback_wait_timeout_s);
     config.temp_warn_c = getDouble(values, "temp_warn_c", config.temp_warn_c);
@@ -162,9 +238,33 @@ bool loadDeployConfig(
       joint.max_torque = getDouble(values, prefix + "max_torque", joint.max_torque);
       joint.max_kp = getDouble(values, prefix + "max_kp", joint.max_kp);
       joint.max_kd = getDouble(values, prefix + "max_kd", joint.max_kd);
+      // ── Calibration sanity checks ──
+      // A negative/zero reduction inverts or collapses the motor→joint slope.
+      // This is exactly the failure mode that drove the rear joints past their
+      // hard stops, so refuse to run rather than send unsafe commands.
       joint.direction = joint.direction < 0.0 ? -1.0 : 1.0;
+      if (!std::isfinite(joint.offset) || !std::isfinite(joint.reduction) ||
+          !std::isfinite(joint.lower) || !std::isfinite(joint.upper) ||
+          !std::isfinite(joint.max_position_step))
+      {
+        error = "joint." + joints[i].name + ": non-finite calibration value";
+        return false;
+      }
+      if (joint.reduction <= 0.0) {
+        error = "joint." + joints[i].name + ": reduction must be > 0 (got " +
+          std::to_string(joint.reduction) + ")";
+        return false;
+      }
       if (joint.lower > joint.upper) {
         std::swap(joint.lower, joint.upper);
+      }
+      if (!(joint.lower < joint.upper)) {
+        error = "joint." + joints[i].name + ": lower must be < upper";
+        return false;
+      }
+      if (joint.max_position_step <= 0.0) {
+        error = "joint." + joints[i].name + ": max_position_step must be > 0";
+        return false;
       }
     }
   } catch (const std::exception & exc) {
@@ -273,8 +373,22 @@ bool readImuFile(const std::string & path, ImuSample & imu, double now_s, std::s
       getDouble(values, "gx", imu.projected_gravity[0]),
       getDouble(values, "gy", imu.projected_gravity[1]),
       getDouble(values, "gz", imu.projected_gravity[2])};
+    // Optional body-frame linear velocity (only present if the bridge or a
+    // state estimator writes vx/vy/vz).
+    imu.linear_velocity = {
+      getDouble(values, "vx", imu.linear_velocity[0]),
+      getDouble(values, "vy", imu.linear_velocity[1]),
+      getDouble(values, "vz", imu.linear_velocity[2])};
+    // In-band monotonic receipt stamps from the bridge. If the bridge is old
+    // (no t=), fall back to the deploy's read time; the bridge's cached-write
+    // behaviour means mtime alone cannot detect a frozen sensor.
+    imu.source_stamp_s = getDouble(values, "t", -1.0);
+    imu.gyro_stamp_s = getDouble(values, "gyro_t", -1.0);
+    imu.quat_stamp_s = getDouble(values, "quat_t", -1.0);
+    imu.gyro_seq = getUint64(values, "gyro_seq", 0);
+    imu.quat_seq = getUint64(values, "quat_seq", 0);
     imu.valid = true;
-    imu.last_update_s = now_s;
+    imu.last_update_s = imu.source_stamp_s > 0.0 ? imu.source_stamp_s : now_s;
   } catch (const std::exception & exc) {
     error = "bad imu file " + path + ": " + exc.what();
     return false;

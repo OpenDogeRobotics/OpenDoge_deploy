@@ -20,10 +20,24 @@ public:
   bool sendEnable(const JointMap & joint);
   bool sendStop(const JointMap & joint, bool clear_fault);
   bool sendReadFaultStatus(const JointMap & joint);
+  /// Read one EL05 parameter (type 17). Used by the feedback watchdog to
+  /// refresh mechPos (0x7019) / mechVel (0x701B) when a joint's reply is lost.
+  bool sendReadParam(const JointMap & joint, std::uint16_t index);
   bool sendMotion(const JointMap & joint, const MotorCommand & command);
+  /// Write the EL05 hardware torque limit (0x700B, 0-6 Nm). RAM-only; the
+  /// motor reverts to its stored limit after a power cycle.
+  bool sendTorqueLimit(const JointMap & joint, double nm);
+  /// Write a uint32 parameter (e.g. 0x7028 canTimeout). RAM-only (no save).
+  /// Read back with sendReadParam(joint, index) and check
+  /// MotorState::can_timeout_received / can_timeout_units.
+  bool sendWriteParamUint32(const JointMap & joint, std::uint16_t index, std::uint32_t value);
   void drain(std::array<MotorState, kNumJoints> & states, double now_s);
 
   bool ok() const { return ok_; }
+  /// Recover from a transient write/read error after a fully successful
+  /// control tick. Without this, one ENOBUFS/ENETDOWN latched ok_=false
+  /// forever and blocked fault-clear even after the bus recovered.
+  void clearError() { ok_ = true; last_error_.clear(); }
   const std::string & lastError() const { return last_error_; }
   const CanStats & stats() const { return stats_; }
 
@@ -32,6 +46,7 @@ private:
   {
     std::string name;
     int fd{-1};
+    std::size_t index{0};  // 0=can0 ... 3=can3 for CanStats::buses
   };
 
   static double clamp(double value, double lower, double upper);

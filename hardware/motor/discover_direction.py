@@ -2,6 +2,10 @@
 """
 OpenDoge 电机方向自动检测 — 轻推关节, 无需掰到站立位。
 
+背景:
+  如果重新安装了电机后需要确定物理上电机方向和仿真里是否符合，
+  通常可以使用同目录下的watch脚本，但是需要自己肉眼测数据，比较麻烦，这个脚本可以解决这个问题
+
 原理:
   每个关节在 URDF 中有明确定义的正方向。轻推关节朝 URDF 正方向,
   观察 mechPos 变化: mechPos 增大 → direction=+1, 减小 → direction=-1。
@@ -38,17 +42,20 @@ LOG_DIR = Path(__file__).resolve().parent / "calibration_logs"
 
 JOINTS = [
     # (name, can, motor_id, urdf_positive_direction_description)
+    # 注意 thigh：URDF 轴 (0,1,0)、连杆沿 -Z，q 增大时膝盖向 -X（尾部）
+    # 移动，所以 URDF 正方向是“膝盖向后”，不是向前（旧文档写反了，
+    # 见 docs/上机问题与代码修改记录.md 修改 54）。
     ("FL_hip_joint",   "can0", 1,   "向外推 (远离身体中线)"),
-    ("FL_thigh_joint", "can0", 2,   "向前推 (腿往头部方向)"),
+    ("FL_thigh_joint", "can0", 2,   "向后推 (膝盖往尾部方向)"),
     ("FL_calf_joint",  "can0", 3,   "伸直小腿 (脚远离身体)"),
     ("FR_hip_joint",   "can1", 4,   "向内推 (靠近身体中线)"),
-    ("FR_thigh_joint", "can1", 5,   "向前推 (腿往头部方向)"),
+    ("FR_thigh_joint", "can1", 5,   "向后推 (膝盖往尾部方向)"),
     ("FR_calf_joint",  "can1", 6,   "伸直小腿 (脚远离身体)"),
     ("RL_hip_joint",   "can2", 7,   "向外推 (远离身体中线)"),
-    ("RL_thigh_joint", "can2", 8,   "向前推 (腿往头部方向)"),
+    ("RL_thigh_joint", "can2", 8,   "向后推 (膝盖往尾部方向)"),
     ("RL_calf_joint",  "can2", 9,   "伸直小腿 (脚远离身体)"),
     ("RR_hip_joint",   "can3", 10,  "向内推 (靠近身体中线)"),
-    ("RR_thigh_joint", "can3", 11,  "向前推 (腿往头部方向)"),
+    ("RR_thigh_joint", "can3", 11,  "向后推 (膝盖往尾部方向)"),
     ("RR_calf_joint",  "can3", 12,  "伸直小腿 (脚远离身体)"),
 ]
 

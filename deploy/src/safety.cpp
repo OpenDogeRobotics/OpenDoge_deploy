@@ -27,6 +27,8 @@ const char * stateName(RuntimeState state)
       return "low_gain_test";
     case RuntimeState::DampingFault:
       return "damping_fault";
+    case RuntimeState::StandingUp:
+      return "standing_up";
   }
   return "unknown";
 }
@@ -77,6 +79,7 @@ bool safetyFault(
   const ImuSample & imu,
   std::array<JointSafetyState, kNumJoints> & safety_state,
   double now_s,
+  double standup_start_s,
   std::string & reason)
 {
   for (std::size_t i = 0; i < states.size(); ++i) {
@@ -139,15 +142,25 @@ bool safetyFault(
     if (runtime_state == RuntimeState::ActivePC
         || runtime_state == RuntimeState::ActiveRL
         || runtime_state == RuntimeState::EnteringPosition
-        || runtime_state == RuntimeState::LowGainTest) {
+        || runtime_state == RuntimeState::LowGainTest
+        || runtime_state == RuntimeState::StandingUp) {
+      // The stand-up target is a deliberate ramp, so a larger transient error
+      // is expected; use the wider standup thresholds there.
+      const bool standing_up = runtime_state == RuntimeState::StandingUp;
+      const double tracking_threshold = standing_up
+        ? config.standup_tracking_error_threshold
+        : config.tracking_error_threshold;
+      const double tracking_timeout = standing_up
+        ? config.standup_tracking_error_timeout_s
+        : config.tracking_error_timeout_s;
       const double logical_actual = logicalPosition(states[i].position, calibration[i]);
       const double error = std::abs(logical_target[i] - logical_actual);
-      if (error > config.tracking_error_threshold) {
+      if (error > tracking_threshold) {
         if (safety_state[i].tracking_error_since_s == 0.0) {
           safety_state[i].tracking_error_since_s = now_s;
-        } else if (now_s - safety_state[i].tracking_error_since_s > config.tracking_error_timeout_s) {
+        } else if (now_s - safety_state[i].tracking_error_since_s > tracking_timeout) {
           reason = joints[i].name + ": tracking error " + std::to_string(error)
-            + " rad > " + std::to_string(config.tracking_error_threshold) + " rad for "
+            + " rad > " + std::to_string(tracking_threshold) + " rad for "
             + std::to_string(now_s - safety_state[i].tracking_error_since_s) + "s";
           return true;
         }
@@ -160,14 +173,37 @@ bool safetyFault(
   // ── IMU-based fall detection ──
   static double fall_since_s = 0.0;
   static double fall_imu_invalid_since_s = 0.0;
+  // Supervised stand-up: the robot starts from the measured (often prone) pose,
+  // so projected_gravity.z ≈ 0 would trip the fall check immediately. This is
+  // a TIME WINDOW from entering StandingUp/LowGainTest, not tied to the current
+  // state, so it also covers the Stand-up → ActiveRL/PC handover. The old
+  // state-tied version re-armed exactly at the handover, so a stand-up jerk
+  // (calf snap) could trip the fall check.
+  const bool standup_grace =
+    standup_start_s > 0.0 &&
+    now_s - standup_start_s < config.standup_grace_s;
+  // Fall detection only matters while the controller is actively driving the
+  // joints. In Ready / DampingFault the motors are only damping, so a tilted
+  // or inverted robot on the bench must not trip a fall fault.
+  const bool fall_monitored =
+    runtime_state == RuntimeState::ActivePC ||
+    runtime_state == RuntimeState::ActiveRL ||
+    runtime_state == RuntimeState::EnteringPosition ||
+    runtime_state == RuntimeState::LowGainTest ||
+    runtime_state == RuntimeState::StandingUp;
   if (imu.valid) {
     fall_imu_invalid_since_s = 0.0;
-    if (imu.projected_gravity[2] < config.fall_gravity_z_threshold) {
+    // projected_gravity.z = -1 when upright (gravity points down along body -z).
+    // A fall/tilt makes it move toward 0 (or +1 when upside down), so the
+    // threshold is applied on the negative side: z > -threshold.
+    if (!fall_monitored || standup_grace) {
+      fall_since_s = 0.0;
+    } else if (imu.projected_gravity[2] > -config.fall_gravity_z_threshold) {
       if (fall_since_s == 0.0) {
         fall_since_s = now_s;
       } else if (now_s - fall_since_s > config.fall_timeout_s) {
         reason = "fall detected: gravity.z=" + std::to_string(imu.projected_gravity[2])
-          + " < " + std::to_string(config.fall_gravity_z_threshold);
+          + " > " + std::to_string(-config.fall_gravity_z_threshold);
         return true;
       }
     } else {

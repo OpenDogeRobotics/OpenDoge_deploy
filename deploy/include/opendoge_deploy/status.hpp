@@ -16,6 +16,11 @@ struct LoopStats
   std::uint64_t target_ticks{0};
   std::uint64_t missed_control_deadlines{0};
   double max_control_late_s{0.0};
+  // Ages of the freshest IMU/joint samples used by the last policy
+  // observation (after the pre-inference refresh). Last-value diagnostics,
+  // not per-window counters: resetWindow() deliberately does not clear them.
+  double last_obs_imu_age_s{-1.0};
+  double last_obs_joint_age_s{-1.0};
 
   void resetWindow()
   {
@@ -44,6 +49,7 @@ void emitStatus(
   const std::string & fault_reason,
   bool rl_fallback_active,
   const std::array<MotorState, kNumJoints> & states,
+  const std::array<double, kNumJoints> & limited_target,
   const std::array<JointCalibration, kNumJoints> & calib,
   const std::array<JointMap, kNumJoints> & joints,
   const ImuSample & imu,

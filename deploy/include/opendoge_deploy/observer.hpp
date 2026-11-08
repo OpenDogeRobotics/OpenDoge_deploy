@@ -12,10 +12,22 @@ namespace opendoge
 /// dt is the time step between phase advances (1.0 / inference_hz).
 double advancePhase(const OperatorCommand & command, double phase, double dt);
 
-/// Build 49-dim single-frame actor observation matching UniLab deployment spec.
-///   gyro(3) + neg_gravity(3) + dof_pos_diff(12) + dof_vel(12)
-///   + last_action(12) + commands(3) + feet_phase(4)
+/// Build the 48-dim LainLab actor observation:
+///   base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3)
+///   + joint_pos_rel(12) + joint_vel_rel(12) + last_action(12) + command(3)
+/// Joint terms are expressed in the training (LainLab) sign convention via
+/// kJointSign. `default_pos` is in firmware URDF convention.
 std::array<double, kObsDim> buildObservation(
+  const std::array<MotorState, kNumJoints> & states,
+  const std::array<JointCalibration, kNumJoints> & calibration,
+  const std::array<double, kNumJoints> & default_pos,
+  const std::array<double, kNumJoints> & last_action,
+  const OperatorCommand & command,
+  const ImuSample & imu);
+
+/// Legacy 49-dim observation (with feet_phase, firmware sign convention).
+/// Debug/regression tooling only — not compatible with the LainLab policy.
+std::array<double, 49> buildLegacyObservation(
   const std::array<MotorState, kNumJoints> & states,
   const std::array<JointCalibration, kNumJoints> & calibration,
   const std::array<double, kNumJoints> & default_pos,

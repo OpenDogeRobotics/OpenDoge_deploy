@@ -165,6 +165,7 @@ class XboxCommandMapper:
         btn_back: int | None = None,
         btn_start: int | None = None,
         btn_rb: int | None = None,
+        btn_estop: int | None = None,
     ):
         self.max_vx = max_vx
         self.max_vy = max_vy
@@ -181,6 +182,8 @@ class XboxCommandMapper:
         self.btn_back = btn_back if btn_back is not None else self.BUTTON_BACK
         self.btn_start = btn_start if btn_start is not None else self.BUTTON_START
         self.btn_rb = btn_rb if btn_rb is not None else self.BUTTON_RB
+        # Optional latching emergency-stop button. None disables it.
+        self.btn_estop = btn_estop
         self.axes: Dict[int, float] = {}
         self.buttons: Dict[int, bool] = {}
         self.active_requested = False
@@ -201,9 +204,13 @@ class XboxCommandMapper:
                     self._handle_button_down(event.number)
 
     def command(self) -> RobotCommand:
+        # Raw joystick axes: X+ = right, Y+ = down.
+        # Robot/URDF body frame (REP-103): X+ = forward, Y+ = left,
+        # yaw+ = counter-clockwise. Negate all three so "stick right" maps to
+        # "move right" and "stick up" maps to "move forward".
         vx_axis = apply_deadzone(-self.axes.get(self.axis_vx, 0.0), self.deadzone)
-        vy_axis = apply_deadzone(self.axes.get(self.axis_vy, 0.0), self.deadzone)
-        yaw_axis = apply_deadzone(self.axes.get(self.axis_yaw, 0.0), self.deadzone)
+        vy_axis = apply_deadzone(-self.axes.get(self.axis_vy, 0.0), self.deadzone)
+        yaw_axis = apply_deadzone(-self.axes.get(self.axis_yaw, 0.0), self.deadzone)
 
         active = self.active_requested and not self.estop
         if self.require_rb and not self.buttons.get(self.btn_rb, False):
@@ -238,9 +245,19 @@ class XboxCommandMapper:
         )
 
     def _handle_button_down(self, button: int) -> None:
-        # A: Start robot and enter position control mode
+        # Latching emergency stop: press once -> estop, zero commands.
+        # Press A afterwards to clear estop and recover.
+        if self.btn_estop is not None and button == self.btn_estop:
+            self.estop = True
+            self.active_requested = False
+            self.position_control = False
+            self.rl_inference = False
+            self.low_gain_mode = False
+            return
+        # A: Start robot and enter position control mode (also clears estop)
         if button == self.btn_a:
             self.estop = False
+            self.clear_fault = True  # one-shot: recover from DampingFault
             self.low_gain_mode = False
             self.active_requested = True
             self.position_control = True
@@ -286,11 +303,14 @@ def format_command_file(command: RobotCommand) -> str:
 
 
 def atomic_write(path: str, text: str) -> None:
+    # Latest-value IPC file: the deploy polls it at 200 Hz. Durability across
+    # a crash is irrelevant, and fsync on ext4 (/tmp is not tmpfs here) adds
+    # several ms per write at 100 Hz, which shows up as gamepad latency.
+    # flush() + os.replace() is enough for a reader to see a complete file.
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{path}.tmp.{os.getpid()}"
     with open(tmp_path, "w", encoding="utf-8") as file:
         file.write(text)
         file.flush()
-        os.fsync(file.fileno())
     os.replace(tmp_path, path)
